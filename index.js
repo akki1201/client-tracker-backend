@@ -10,7 +10,7 @@ const fs          = require("fs");
 const TOKEN        = process.env.TELEGRAM_TOKEN;
 const ADMIN_PHONE  = process.env.ADMIN_PHONE;
 const PORT         = process.env.PORT || 3001;
-const DATA_DIR     = path.join(__dirname, "../data");
+const DATA_DIR     = path.join(__dirname, "data");
 const EXCEL_PATH   = path.join(DATA_DIR, "clients.xlsx");
 const USERS_PATH   = path.join(DATA_DIR, "users.json");
 const CLIENTS_PATH = path.join(DATA_DIR, "clients.json");
@@ -312,7 +312,7 @@ bot.onText(/\/total/, msg => {
   const hot  = all.filter(c => c.status === "Hot").length;
   const cold = all.filter(c => c.status === "Cold").length;
   bot.sendMessage(msg.chat.id,
-    `📊 *Totals:*\n\nAll: *${all.length}*\n🔴 Hot: ${hot}  🟡 Warm: ${warm}  🔵 Cold: ${cold}`,
+    `📊 *Totals:*\n\nAll: *${all.length}*\n🔴 Hot: ${hot}  🔵 Cold: ${cold}`,
     { parse_mode: "Markdown" }
   );
 });
