@@ -542,7 +542,8 @@ bot.on("message", async msg => {
     `${client.notes.length ? `\n📝 ${client.notes[0].text}` : ""}` +
     `\n📅 ${client.date}\n\n` +
     `_To add a note: /note ${id} your note here_\n` +
-    `_To set follow-up: /remind ${id} 25/01/2025_`,
+    `_To set follow-up: /remind ${id} 25/01/2025_\n\n` +
+    `🌐 [View Dashboard](https://client.webolev.com)`,
     { parse_mode: "Markdown" }
   );
 });
