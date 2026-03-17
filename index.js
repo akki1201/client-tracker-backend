@@ -29,6 +29,17 @@ const noteSchema = new mongoose.Schema({
   at:   String,
 });
 
+
+// Add indexes for faster queries
+clientSchema.index({ status: 1 });
+clientSchema.index({ number: 1 });
+clientSchema.index({ followUpDate: 1 });
+clientSchema.index({ createdAt: -1 });
+
+const Client = mongoose.model("Client", clientSchema);
+const User   = mongoose.model("User",   userSchema);
+
+
 const clientSchema = new mongoose.Schema({
   name:         String,
   number:       String,
@@ -492,8 +503,15 @@ app.use(cors());
 app.use(express.json());
 
 app.get("/api/clients", async (req, res) => {
-  const clients = await Client.find().sort({ createdAt: -1 });
-  res.json(clients);
+  const page  = parseInt(req.query.page)  || 1;
+  const limit = parseInt(req.query.limit) || 50;
+
+  const [clients, total] = await Promise.all([
+    Client.find().sort({ createdAt: -1 }).skip((page-1)*limit).limit(limit),
+    Client.countDocuments()
+  ]);
+
+  res.json({ clients, total, page, pages: Math.ceil(total/limit) });
 });
 
 app.get("/api/clients/download", async (req, res) => {
@@ -502,13 +520,18 @@ app.get("/api/clients/download", async (req, res) => {
 });
 
 app.get("/api/stats", async (req, res) => {
-  const total    = await Client.countDocuments();
-  const products = await Client.distinct("product");
-  const hot      = await Client.countDocuments({ status: "Hot" });
-  const cold     = await Client.countDocuments({ status: "Cold" });
-  const closed   = await Client.countDocuments({ status: "Closed" });
-  const approved = await User.countDocuments({ status: "approved" });
-  const pending  = await User.countDocuments({ status: "pending" });
+  // All 7 queries run at the SAME TIME instead of one by one
+  const [total, products, hot, cold, closed, approved, pending] = await Promise.all([
+    Client.countDocuments(),
+    Client.distinct("product"),
+    Client.countDocuments({ status: "Hot" }),
+    Client.countDocuments({ status: "Cold" }),
+    Client.countDocuments({ status: "Closed" }),
+    User.countDocuments({ status: "approved" }),
+    User.countDocuments({ status: "pending" }),
+  ]);
+
+  res.set("Cache-Control", "public, max-age=30"); // browser caches for 30 seconds
   res.json({
     total, products,
     byStatus: { Hot: hot, Cold: cold, Closed: closed },
