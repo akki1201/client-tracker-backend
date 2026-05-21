@@ -1,2 +1,0 @@
-# client-tracker-backend
-

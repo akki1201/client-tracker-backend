@@ -3,131 +3,56 @@ const express     = require("express");
 const cors        = require("cors");
 const TelegramBot = require("node-telegram-bot-api");
 const ExcelJS     = require("exceljs");
-const mongoose    = require("mongoose");
 const path        = require("path");
-const fs          = require("fs");
+const { admin, db } = require("./firebase");
 
-// ─── Config ────────────────────────────────────────────────────────────────────
-const TOKEN        = process.env.TELEGRAM_TOKEN;
-const ADMIN_PHONE  = process.env.ADMIN_PHONE;
-const MONGODB_URI  = process.env.MONGODB_URI;
-const PORT         = process.env.PORT || 3001;
+// ── Config ────────────────────────────────────────────────────────────────────
+const TOKEN       = process.env.TELEGRAM_TOKEN;
+const ADMIN_PHONE = process.env.ADMIN_PHONE;
+const PORT        = process.env.PORT || 3001;
 
 if (!TOKEN)       { console.error("❌ TELEGRAM_TOKEN missing"); process.exit(1); }
 if (!ADMIN_PHONE) { console.error("❌ ADMIN_PHONE missing");    process.exit(1); }
-if (!MONGODB_URI) { console.error("❌ MONGODB_URI missing");    process.exit(1); }
 
-// ─── MongoDB connection ────────────────────────────────────────────────────────
-mongoose.connect(MONGODB_URI)
-  .then(() => console.log("✅ MongoDB connected"))
-  .catch(err => { console.error("❌ MongoDB error:", err); process.exit(1); });
+// ── Firestore Collections ─────────────────────────────────────────────────────
+const clientsCol = db.collection("clients");
+const usersCol   = db.collection("users");
 
-// ─── Schemas ───────────────────────────────────────────────────────────────────
-const noteSchema = new mongoose.Schema({
-  text: String,
-  by:   String,
-  at:   String,
-});
-
-
-// Add indexes for faster queries
-clientSchema.index({ status: 1 });
-clientSchema.index({ number: 1 });
-clientSchema.index({ followUpDate: 1 });
-clientSchema.index({ createdAt: -1 });
-
-const Client = mongoose.model("Client", clientSchema);
-const User   = mongoose.model("User",   userSchema);
-
-
-const clientSchema = new mongoose.Schema({
-  name:         String,
-  number:       String,
-  product:      String,
-  price:        { type: String, default: "" },
-  status:       { type: String, default: "Hot" },
-  notes:        [noteSchema],
-  followUpDate: { type: String, default: "" },
-  followUpNote: { type: String, default: "" },
-  addedBy:      String,
-  addedOn:      String,
-  date:         String,
-}, { timestamps: true });
-
-const userSchema = new mongoose.Schema({
-  phone:       { type: String, unique: true },
-  name:        String,
-  chatId:      Number,
-  status:      { type: String, enum: ["approved","pending"], default: "pending" },
-  requestedAt: { type: Date, default: Date.now },
-  addedAt:     Date,
-});
-
-const Client = mongoose.model("Client", clientSchema);
-const User   = mongoose.model("User",   userSchema);
-
-// ─── Helpers ───────────────────────────────────────────────────────────────────
-function nowIST() {
-  return new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-}
-function todayIST() {
-  return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" });
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function nowIST()          { return new Date().toLocaleString("en-IN",     { timeZone: "Asia/Kolkata" }); }
+function todayIST()        { return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" }); }
 function normalizePhone(p) { return String(p).replace(/\D/g, ""); }
 function isAdmin(phone)    { return normalizePhone(phone) === normalizePhone(ADMIN_PHONE); }
 function capitalize(s)     { if (!s) return s; return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase(); }
 
 async function getApprovedByChatId(chatId) {
-  return User.findOne({ chatId: Number(chatId), status: "approved" });
+  const snap = await usersCol
+    .where("chatId", "==", Number(chatId))
+    .where("status", "==", "approved")
+    .limit(1)
+    .get();
+  return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
 }
 
-// ─── Excel export ──────────────────────────────────────────────────────────────
-async function rebuildExcel() {
-  const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet("Clients");
-  ws.columns = [
-    { header: "Name",        key: "name",        width: 22 },
-    { header: "Number",      key: "number",      width: 16 },
-    { header: "Product",     key: "product",     width: 22 },
-    { header: "Price (₹)",   key: "price",       width: 14 },
-    { header: "Status",      key: "status",      width: 12 },
-    { header: "Last Note",   key: "lastNote",    width: 38 },
-    { header: "Follow Up",   key: "followUpDate",width: 14 },
-    { header: "Added By",    key: "addedBy",     width: 16 },
-    { header: "Added On",    key: "addedOn",     width: 22 },
-  ];
-  ws.getRow(1).eachCell(cell => {
-    cell.font      = { bold: true, color: { argb: "FFFFFFFF" } };
-    cell.fill      = { type: "pattern", pattern: "solid", fgColor: { argb: "FF2563EB" } };
-    cell.alignment = { vertical: "middle", horizontal: "center" };
-  });
-  ws.getRow(1).height = 22;
-
-  const clients = await Client.find().sort({ createdAt: 1 });
-  const statusColors = { Hot: "FFFEE2E2", Cold: "FFEFF6FF", Closed: "FFF0FDF4" };
-
-  clients.forEach((c, i) => {
-    const lastNote = c.notes?.length ? c.notes[c.notes.length - 1].text : "";
-    const row = ws.addRow({
-      name: c.name, number: c.number, product: c.product,
-      price: c.price, status: c.status || "Hot",
-      lastNote, followUpDate: c.followUpDate || "",
-      addedBy: c.addedBy, addedOn: c.addedOn,
-    });
-    const bg = statusColors[c.status] || (i % 2 === 0 ? "FFEFF6FF" : "FFFFFFFF");
-    row.eachCell(cell => {
-      cell.fill      = { type: "pattern", pattern: "solid", fgColor: { argb: bg } };
-      cell.alignment = { vertical: "middle", wrapText: true };
-    });
-    row.height = 20;
-  });
-
-  const excelPath = path.join("/tmp", "clients.xlsx");
-  await wb.xlsx.writeFile(excelPath);
-  return excelPath;
+// Cache admin chatId to avoid repeated Firestore reads on every notify
+let _adminChatIdCache = null;
+async function getAdminChatId() {
+  if (_adminChatIdCache) return _adminChatIdCache;
+  const phone = normalizePhone(ADMIN_PHONE);
+  const snap  = await usersCol.where("phone", "==", phone).limit(1).get();
+  if (!snap.empty && snap.docs[0].data().chatId) {
+    _adminChatIdCache = snap.docs[0].data().chatId;
+    return _adminChatIdCache;
+  }
+  return null;
 }
 
-// ─── Smart parser ──────────────────────────────────────────────────────────────
+async function notifyAdmin(text) {
+  const chatId = await getAdminChatId();
+  if (chatId) bot.sendMessage(chatId, text, { parse_mode: "Markdown" });
+}
+
+// ── Smart Parser ──────────────────────────────────────────────────────────────
 function smartParse(text) {
   const fields = { status: "Hot" };
   const t = text.trim();
@@ -139,13 +64,13 @@ function smartParse(text) {
       const k = line.slice(0, idx).trim().toLowerCase();
       const v = line.slice(idx + 1).trim();
       if (!v) continue;
-      if (k === "name")                                              fields.name    = v;
-      else if (["number","phone","mob","mobile"].includes(k))        fields.number  = v;
-      else if (["product","service","item","p"].includes(k))         fields.product = v;
-      else if (["price","amount","amt","cost"].includes(k))          fields.price   = v;
-      else if (["note","notes","talk","last talk","remark"].includes(k)) fields.note = v;
-      else if (["status","stage"].includes(k))                       fields.status  = capitalize(v);
-      else if (["followup","follow up","follow-up","reminder"].includes(k)) fields.followUpDate = v;
+      if (k === "name")                                                      fields.name    = v;
+      else if (["number","phone","mob","mobile"].includes(k))                fields.number  = v;
+      else if (["product","service","item","p"].includes(k))                 fields.product = v;
+      else if (["price","amount","amt","cost"].includes(k))                  fields.price   = v;
+      else if (["note","notes","talk","last talk","remark"].includes(k))     fields.note    = v;
+      else if (["status","stage"].includes(k))                               fields.status  = capitalize(v);
+      else if (["followup","follow up","follow-up","reminder"].includes(k))  fields.followUpDate = v;
     }
     return { fields, missing: ["name","number","product"].filter(f => !fields[f]), format: "keyvalue" };
   }
@@ -169,7 +94,7 @@ function smartParse(text) {
     const after      = t.slice(phoneMatch.index + phoneMatch[0].length).trim();
     const afterParts = after.split(/\s+/);
     const lastToken  = afterParts[afterParts.length - 1];
-    const looksLikePrice = /^\d[\d,.kK lL]*$/.test(lastToken);
+    const looksLikePrice = /^\d[\d,.kKlL]*$/.test(lastToken);
     fields.name    = before || null;
     fields.number  = phone;
     fields.product = looksLikePrice ? afterParts.slice(0, -1).join(" ") : after;
@@ -180,25 +105,68 @@ function smartParse(text) {
   return { fields, missing: ["name","number","product"], format: "unknown" };
 }
 
-// ─── Bot ───────────────────────────────────────────────────────────────────────
-const bot = new TelegramBot(TOKEN, { polling: true });
-let adminChatId = null;
+// ── Excel Export ──────────────────────────────────────────────────────────────
+async function rebuildExcel() {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet("Clients");
+  ws.columns = [
+    { header: "Name",        key: "name",        width: 22 },
+    { header: "Number",      key: "number",      width: 16 },
+    { header: "Product",     key: "product",     width: 22 },
+    { header: "Price (₹)",   key: "price",       width: 14 },
+    { header: "Status",      key: "status",      width: 12 },
+    { header: "Last Note",   key: "lastNote",    width: 38 },
+    { header: "Follow Up",   key: "followUpDate",width: 14 },
+    { header: "Follow Note", key: "followUpNote",width: 28 },
+    { header: "Added By",    key: "addedBy",     width: 16 },
+    { header: "Added On",    key: "addedOn",     width: 22 },
+  ];
+  ws.getRow(1).eachCell(cell => {
+    cell.font      = { bold: true, color: { argb: "FFFFFFFF" } };
+    cell.fill      = { type: "pattern", pattern: "solid", fgColor: { argb: "FF2563EB" } };
+    cell.alignment = { vertical: "middle", horizontal: "center" };
+  });
+  ws.getRow(1).height = 22;
 
-function notifyAdmin(text) {
-  if (adminChatId) bot.sendMessage(adminChatId, text, { parse_mode: "Markdown" });
+  const snap         = await clientsCol.orderBy("createdAt", "asc").get();
+  const statusColors = { Hot: "FFFEE2E2", Cold: "FFEFF6FF", Closed: "FFF0FDF4" };
+
+  snap.docs.forEach((doc, i) => {
+    const c        = doc.data();
+    const lastNote = c.notes?.length ? c.notes[c.notes.length - 1].text : "";
+    const row = ws.addRow({
+      name: c.name, number: c.number, product: c.product,
+      price: c.price, status: c.status || "Hot",
+      lastNote, followUpDate: c.followUpDate || "",
+      followUpNote: c.followUpNote || "",
+      addedBy: c.addedBy, addedOn: c.addedOn,
+    });
+    const bg = statusColors[c.status] || (i % 2 === 0 ? "FFEFF6FF" : "FFFFFFFF");
+    row.eachCell(cell => {
+      cell.fill      = { type: "pattern", pattern: "solid", fgColor: { argb: bg } };
+      cell.alignment = { vertical: "middle", wrapText: true };
+    });
+    row.height = 20;
+  });
+
+  const excelPath = path.join("/tmp", "clients.xlsx");
+  await wb.xlsx.writeFile(excelPath);
+  return excelPath;
 }
 
-// /start
+// ── Telegram Bot ──────────────────────────────────────────────────────────────
+const bot = new TelegramBot(TOKEN, { polling: true });
+
 bot.onText(/\/start/, async msg => {
   const existing = await getApprovedByChatId(msg.chat.id);
   if (existing) {
     return bot.sendMessage(msg.chat.id,
-      `✅ *Welcome back, ${existing.name}!*\n\nSend /help to see how to add clients.`,
+      `✅ *Welcome back, ${existing.name}!*\n\nSend /help to see commands.`,
       { parse_mode: "Markdown" }
     );
   }
   bot.sendMessage(msg.chat.id,
-    "👋 *Welcome to Client Tracker!*\n\nTap the button below to share your phone number and request access.",
+    "👋 *Welcome to Client Tracker!*\n\nTap below to share your phone number and request access.",
     {
       parse_mode: "Markdown",
       reply_markup: {
@@ -209,7 +177,6 @@ bot.onText(/\/start/, async msg => {
   );
 });
 
-// Contact received
 bot.on("contact", async msg => {
   const contact = msg.contact;
   const phone   = normalizePhone(contact.phone_number);
@@ -217,11 +184,10 @@ bot.on("contact", async msg => {
   const chatId  = Number(msg.chat.id);
 
   if (isAdmin(phone)) {
-    adminChatId = chatId;
-    await User.findOneAndUpdate(
-      { phone },
-      { name, chatId, status: "approved", addedAt: new Date() },
-      { upsert: true, new: true }
+    _adminChatIdCache = chatId; // update cache
+    await usersCol.doc(phone).set(
+      { phone, name, chatId, status: "approved", addedAt: new Date().toISOString() },
+      { merge: true }
     );
     return bot.sendMessage(chatId,
       `✅ *Welcome, ${name}! You're the admin.*\n\n` +
@@ -234,19 +200,18 @@ bot.on("contact", async msg => {
     );
   }
 
-  const existing = await User.findOne({ phone, status: "approved" });
-  if (existing) {
-    await User.findOneAndUpdate({ phone }, { chatId });
+  const existingSnap = await usersCol.where("phone", "==", phone).where("status", "==", "approved").limit(1).get();
+  if (!existingSnap.empty) {
+    await usersCol.doc(phone).set({ chatId }, { merge: true });
     return bot.sendMessage(chatId,
       "✅ *You already have access!*\n\nSend /help to get started.",
       { parse_mode: "Markdown", reply_markup: { remove_keyboard: true } }
     );
   }
 
-  await User.findOneAndUpdate(
-    { phone },
-    { name, chatId, status: "pending", requestedAt: new Date() },
-    { upsert: true, new: true }
+  await usersCol.doc(phone).set(
+    { phone, name, chatId, status: "pending", requestedAt: new Date().toISOString() },
+    { merge: true }
   );
   bot.sendMessage(chatId,
     `⏳ *Request sent, ${name}!*\n\nYou'll get a message once approved.`,
@@ -255,7 +220,6 @@ bot.on("contact", async msg => {
   notifyAdmin(`🔔 *New access request*\n\n👤 ${name}\n📞 +${phone}\n\`/adduser +${phone}\``);
 });
 
-// /help
 bot.onText(/\/help/, async msg => {
   const user = await getApprovedByChatId(msg.chat.id);
   if (!user) return bot.sendMessage(msg.chat.id, "⛔ No access. Send /start.");
@@ -267,139 +231,146 @@ bot.onText(/\/help/, async msg => {
     "`Rahul 9876543210 CRM 45000`\n`Rahul / 98765 / CRM / 45000`\n\n" +
     "*Commands:*\n`/list` — recent 5\n`/total` — count\n`/find Rahul` — search\n" +
     "`/note 9876543210 text` — add note\n`/status 9876543210 Hot` — update\n" +
-    "`/remind 9876543210 25/03/2026 note` — follow-up\n`/delete 9876543210` — delete\n" +
+    "`/remind 9876543210 25/03/2026 note` — follow-up\n`/reminders` — today's due\n`/delete 9876543210` — delete\n" +
     adminCmds,
     { parse_mode: "Markdown" }
   );
 });
 
-// /list
 bot.onText(/\/list/, async msg => {
   if (!await getApprovedByChatId(msg.chat.id)) return bot.sendMessage(msg.chat.id, "⛔ No access.");
-  const recent = await Client.find().sort({ createdAt: -1 }).limit(5);
-  if (!recent.length) return bot.sendMessage(msg.chat.id, "📭 No clients yet.");
-  const lines = recent.map(c =>
-    `• *${c.name}* — ${c.product}${c.price ? ` — ₹${c.price}` : ""} [${c.status}]`
-  );
+  const snap = await clientsCol.orderBy("createdAt", "desc").limit(5).get();
+  if (snap.empty) return bot.sendMessage(msg.chat.id, "🔭 No clients yet.");
+  const lines = snap.docs.map(d => {
+    const c = d.data();
+    return `• *${c.name}* — ${c.product}${c.price ? ` — ₹${c.price}` : ""} [${c.status}]`;
+  });
   bot.sendMessage(msg.chat.id, `📋 *Recent clients:*\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
 });
 
-// /total
 bot.onText(/\/total/, async msg => {
   if (!await getApprovedByChatId(msg.chat.id)) return bot.sendMessage(msg.chat.id, "⛔ No access.");
-  const total  = await Client.countDocuments();
-  const hot    = await Client.countDocuments({ status: "Hot" });
-  const cold   = await Client.countDocuments({ status: "Cold" });
-  const closed = await Client.countDocuments({ status: "Closed" });
+  const [allSnap, hotSnap, coldSnap, closedSnap] = await Promise.all([
+    clientsCol.count().get(),
+    clientsCol.where("status","==","Hot").count().get(),
+    clientsCol.where("status","==","Cold").count().get(),
+    clientsCol.where("status","==","Closed").count().get(),
+  ]);
   bot.sendMessage(msg.chat.id,
-    `📊 *Totals:*\n\nAll: *${total}*\n🔴 Hot: ${hot}  🔵 Cold: ${cold}  ✅ Closed: ${closed}`,
+    `📊 *Totals:*\n\nAll: *${allSnap.data().count}*\n🔴 Hot: ${hotSnap.data().count}  🔵 Cold: ${coldSnap.data().count}  ✅ Closed: ${closedSnap.data().count}`,
     { parse_mode: "Markdown" }
   );
 });
 
-// /find
 bot.onText(/\/find (.+)/, async (msg, match) => {
   if (!await getApprovedByChatId(msg.chat.id)) return bot.sendMessage(msg.chat.id, "⛔ No access.");
-  const q = match[1];
-  const results = await Client.find({
-    $or: [
-      { name:    { $regex: q, $options: "i" } },
-      { number:  { $regex: q, $options: "i" } },
-      { product: { $regex: q, $options: "i" } },
-    ]
-  }).limit(5);
-  if (!results.length) return bot.sendMessage(msg.chat.id, `🔍 No results for "${q}"`);
+  const q       = match[1].toLowerCase();
+  const snap    = await clientsCol.get();
+  const results = snap.docs
+    .map(d => ({ id: d.id, ...d.data() }))
+    .filter(c =>
+      c.name?.toLowerCase().includes(q) ||
+      c.number?.includes(q) ||
+      c.product?.toLowerCase().includes(q)
+    )
+    .slice(0, 5);
+  if (!results.length) return bot.sendMessage(msg.chat.id, `🔍 No results for "${match[1]}"`);
   const lines = results.map(c =>
     `*${c.name}*\n📞 ${c.number} | 📦 ${c.product} | [${c.status}]${c.price ? ` | ₹${c.price}` : ""}`
   );
   bot.sendMessage(msg.chat.id, lines.join("\n\n"), { parse_mode: "Markdown" });
 });
 
-// /note
 bot.onText(/\/note (\S+) (.+)/, async (msg, match) => {
   const user = await getApprovedByChatId(msg.chat.id);
   if (!user) return bot.sendMessage(msg.chat.id, "⛔ No access.");
-  const q = match[1];
-  const c = await Client.findOne({
-    $or: [{ number: { $regex: normalizePhone(q) } }]
-  });
-  if (!c) return bot.sendMessage(msg.chat.id, `❌ Client not found for "${q}".`);
-  c.notes.push({ text: match[2], by: user.name, at: nowIST() });
-  await c.save();
+  const num  = normalizePhone(match[1]);
+  const snap = await clientsCol.where("number", "==", num).limit(1).get();
+  if (snap.empty) return bot.sendMessage(msg.chat.id, `❌ Client not found for "${match[1]}".`);
+  const docRef = snap.docs[0].ref;
+  const c      = snap.docs[0].data();
+  const notes  = c.notes || [];
+  notes.push({ text: match[2], by: user.name, at: nowIST() });
+  await docRef.update({ notes });
   bot.sendMessage(msg.chat.id, `📝 Note added to *${c.name}*\n\n"${match[2]}"`, { parse_mode: "Markdown" });
 });
 
-// /status
 bot.onText(/\/status (\S+) (\w+)/, async (msg, match) => {
   const user = await getApprovedByChatId(msg.chat.id);
   if (!user) return bot.sendMessage(msg.chat.id, "⛔ No access.");
-  const valid = ["Hot", "Cold", "Closed"];
+  const valid     = ["Hot","Cold","Closed"];
   const newStatus = capitalize(match[2]);
-  if (!valid.includes(newStatus)) return bot.sendMessage(msg.chat.id, `⚠️ Status must be: Hot, Cold, Closed`);
-  const c = await Client.findOne({ number: { $regex: normalizePhone(match[1]) } });
-  if (!c) return bot.sendMessage(msg.chat.id, `❌ Client not found.`);
-  const old = c.status;
-  c.status = newStatus;
-  await c.save();
+  if (!valid.includes(newStatus)) return bot.sendMessage(msg.chat.id, "⚠️ Status must be: Hot, Cold, Closed");
+  const num  = normalizePhone(match[1]);
+  const snap = await clientsCol.where("number", "==", num).limit(1).get();
+  if (snap.empty) return bot.sendMessage(msg.chat.id, "❌ Client not found.");
+  const old = snap.docs[0].data().status;
+  await snap.docs[0].ref.update({ status: newStatus });
   const emoji = { Hot:"🔴", Cold:"🔵", Closed:"✅" }[newStatus] || "";
-  bot.sendMessage(msg.chat.id, `${emoji} *${c.name}* status: ${old} → *${newStatus}*`, { parse_mode: "Markdown" });
+  bot.sendMessage(msg.chat.id, `${emoji} *${snap.docs[0].data().name}* status: ${old} → *${newStatus}*`, { parse_mode: "Markdown" });
 });
 
-// /remind
 bot.onText(/\/remind (\S+) (\S+)(?: (.+))?/, async (msg, match) => {
   const user = await getApprovedByChatId(msg.chat.id);
   if (!user) return bot.sendMessage(msg.chat.id, "⛔ No access.");
-  const c = await Client.findOne({ number: { $regex: normalizePhone(match[1]) } });
-  if (!c) return bot.sendMessage(msg.chat.id, `❌ Client not found.`);
-  c.followUpDate = match[2];
-  c.followUpNote = match[3] || "";
-  await c.save();
+  const num  = normalizePhone(match[1]);
+  const snap = await clientsCol.where("number", "==", num).limit(1).get();
+  if (snap.empty) return bot.sendMessage(msg.chat.id, "❌ Client not found.");
+  const c = snap.docs[0].data();
+  await snap.docs[0].ref.update({ followUpDate: match[2], followUpNote: match[3] || "" });
   bot.sendMessage(msg.chat.id,
     `⏰ Follow-up set for *${c.name}*\n📅 ${match[2]}${match[3] ? `\n📌 ${match[3]}` : ""}`,
     { parse_mode: "Markdown" }
   );
 });
 
-// /delete
-bot.onText(/\/delete (\S+)/, async (msg, match) => {
-  const user = await getApprovedByChatId(msg.chat.id);
-  if (!user) return bot.sendMessage(msg.chat.id, "⛔ No access.");
-  const c = await Client.findOneAndDelete({ number: { $regex: normalizePhone(match[1]) } });
-  if (!c) return bot.sendMessage(msg.chat.id, `❌ Client not found.`);
-  bot.sendMessage(msg.chat.id, `🗑 *${c.name}* deleted.`, { parse_mode: "Markdown" });
-});
-
-// /reminders
 bot.onText(/\/reminders/, async msg => {
   if (!await getApprovedByChatId(msg.chat.id)) return bot.sendMessage(msg.chat.id, "⛔ No access.");
   const today = todayIST();
-  const due = await Client.find({ followUpDate: today });
-  if (!due.length) return bot.sendMessage(msg.chat.id, "✅ No follow-ups due today.");
-  const lines = due.map(c => `• *${c.name}* — ${c.product}${c.followUpNote ? `\n  📌 ${c.followUpNote}` : ""}`);
+  const snap  = await clientsCol.where("followUpDate", "==", today).get();
+  if (snap.empty) return bot.sendMessage(msg.chat.id, "✅ No follow-ups due today.");
+  const lines = snap.docs.map(d => {
+    const c = d.data();
+    return `• *${c.name}* — ${c.product}${c.followUpNote ? `\n  📌 ${c.followUpNote}` : ""}`;
+  });
   bot.sendMessage(msg.chat.id, `⏰ *Follow-ups today:*\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
 });
 
-// Admin commands
+bot.onText(/\/delete (\S+)/, async (msg, match) => {
+  const user = await getApprovedByChatId(msg.chat.id);
+  if (!user) return bot.sendMessage(msg.chat.id, "⛔ No access.");
+  const num  = normalizePhone(match[1]);
+  const snap = await clientsCol.where("number", "==", num).limit(1).get();
+  if (snap.empty) return bot.sendMessage(msg.chat.id, "❌ Client not found.");
+  const name = snap.docs[0].data().name;
+  await snap.docs[0].ref.delete();
+  bot.sendMessage(msg.chat.id, `🗑 *${name}* deleted.`, { parse_mode: "Markdown" });
+});
+
 bot.onText(/\/adduser (.+)/, async (msg, match) => {
   const caller = await getApprovedByChatId(msg.chat.id);
   if (!caller || !isAdmin(caller.phone)) return bot.sendMessage(msg.chat.id, "⛔ Admin only.");
   const phone = normalizePhone(match[1]);
   if (phone.length < 10) return bot.sendMessage(msg.chat.id, "⚠️ Invalid number.");
-  const u = await User.findOneAndUpdate(
-    { phone },
-    { status: "approved", addedAt: new Date() },
-    { new: true }
+  const docSnap = await usersCol.doc(phone).get();
+  await usersCol.doc(phone).set(
+    { status: "approved", addedAt: new Date().toISOString() },
+    { merge: true }
   );
   bot.sendMessage(msg.chat.id, `✅ +${phone} approved!`);
-  if (u?.chatId) bot.sendMessage(u.chatId, "🎉 *You've been approved!* Send /help to get started.", { parse_mode: "Markdown" });
+  if (docSnap.exists && docSnap.data().chatId) {
+    bot.sendMessage(docSnap.data().chatId, "🎉 *You've been approved!* Send /help to get started.", { parse_mode: "Markdown" });
+  }
 });
 
 bot.onText(/\/removeuser (.+)/, async (msg, match) => {
   const caller = await getApprovedByChatId(msg.chat.id);
   if (!caller || !isAdmin(caller.phone)) return bot.sendMessage(msg.chat.id, "⛔ Admin only.");
-  const phone = normalizePhone(match[1]);
-  const u = await User.findOneAndDelete({ phone });
-  if (!u) return bot.sendMessage(msg.chat.id, "⚠️ User not found.");
+  const phone   = normalizePhone(match[1]);
+  const docSnap = await usersCol.doc(phone).get();
+  if (!docSnap.exists) return bot.sendMessage(msg.chat.id, "⚠️ User not found.");
+  const u = docSnap.data();
+  await usersCol.doc(phone).delete();
   bot.sendMessage(msg.chat.id, `🗑 ${u.name} removed.`);
   if (u.chatId) bot.sendMessage(u.chatId, "ℹ️ Your access has been removed.");
 });
@@ -407,8 +378,9 @@ bot.onText(/\/removeuser (.+)/, async (msg, match) => {
 bot.onText(/\/users/, async msg => {
   const caller = await getApprovedByChatId(msg.chat.id);
   if (!caller || !isAdmin(caller.phone)) return bot.sendMessage(msg.chat.id, "⛔ Admin only.");
-  const approved = await User.find({ status: "approved" });
-  const pending  = await User.find({ status: "pending" });
+  const snap     = await usersCol.get();
+  const approved = snap.docs.filter(d => d.data().status === "approved").map(d => d.data());
+  const pending  = snap.docs.filter(d => d.data().status === "pending").map(d => d.data());
   let text = `👥 *Approved (${approved.length})*\n\n`;
   approved.forEach(u => { text += `• ${u.name} — +${u.phone}\n`; });
   if (pending.length) {
@@ -418,33 +390,7 @@ bot.onText(/\/users/, async msg => {
   bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
 });
 
-// Daily reminders at 9am IST
-function scheduleDailyReminders() {
-  const ist  = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-  const next = new Date(ist);
-  next.setHours(9, 0, 0, 0);
-  if (next <= ist) next.setDate(next.getDate() + 1);
-  setTimeout(() => {
-    sendDailyReminders();
-    setInterval(sendDailyReminders, 24 * 60 * 60 * 1000);
-  }, next - ist);
-}
-
-async function sendDailyReminders() {
-  const today   = todayIST();
-  const due     = await Client.find({ followUpDate: today });
-  if (!due.length) return;
-  const approved = await User.find({ status: "approved", chatId: { $ne: null } });
-  approved.forEach(user => {
-    const lines = due.map(c => `• *${c.name}* — ${c.product}${c.followUpNote ? `\n  📌 ${c.followUpNote}` : ""}`);
-    bot.sendMessage(user.chatId,
-      `🌅 *Good morning! Follow-ups today:*\n\n${lines.join("\n")}\n\nSend /reminders to check anytime.`,
-      { parse_mode: "Markdown" }
-    );
-  });
-}
-
-// Main message handler
+// Main message handler — add client
 bot.on("message", async msg => {
   if (msg.contact || msg.text?.startsWith("/")) return;
   const user = await getApprovedByChatId(msg.chat.id);
@@ -466,124 +412,265 @@ bot.on("message", async msg => {
     );
   }
 
-  const client = await Client.create({
+  const now    = nowIST();
+  const today  = todayIST();
+  const status = ["Hot","Cold","Closed"].includes(fields.status) ? fields.status : "Hot";
+  const docRef = clientsCol.doc();
+  await docRef.set({
     name:         fields.name,
-    number:       fields.number,
+    number:       normalizePhone(fields.number),
     product:      fields.product,
     price:        fields.price || "",
-    status:       ["Hot","Cold","Closed"].includes(fields.status) ? fields.status : "Hot",
-    notes:        fields.note ? [{ text: fields.note, by: user.name, at: nowIST() }] : [],
+    status,
+    notes:        fields.note ? [{ text: fields.note, by: user.name, at: now }] : [],
     followUpDate: fields.followUpDate || "",
     followUpNote: "",
     addedBy:      user.name,
-    addedOn:      nowIST(),
-    date:         todayIST(),
+    addedOn:      now,
+    date:         today,
+    createdAt:    admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  const emoji = { Hot:"🔴", Cold:"🔵", Closed:"✅" }[client.status] || "🔴";
+  const emoji = { Hot:"🔴", Cold:"🔵", Closed:"✅" }[status] || "🔴";
   bot.sendMessage(msg.chat.id,
     `✅ *Client saved!*\n\n` +
-    `👤 ${client.name}\n📞 ${client.number}\n📦 ${client.product}` +
-    `${client.price ? `\n💰 ₹${client.price}` : ""}` +
-    `\n${emoji} ${client.status}` +
-    `${client.notes.length ? `\n📝 ${client.notes[0].text}` : ""}` +
-    `\n📅 ${client.date}\n\n` +
-    `_/note ${client.number} your note_\n` +
-    `_/remind ${client.number} 25/03/2026_\n\n` +
-    `🌐 [View Dashboard](https://client.webolev.com)`,
+    `👤 ${fields.name}\n📞 ${fields.number}\n📦 ${fields.product}` +
+    `${fields.price ? `\n💰 ₹${fields.price}` : ""}` +
+    `\n${emoji} ${status}` +
+    `${fields.note ? `\n📝 ${fields.note}` : ""}` +
+    `\n📅 ${today}\n\n` +
+    `_/note ${fields.number} your note_\n` +
+    `_/remind ${fields.number} 25/03/2026_\n\n` +
+    `🌐 [View Dashboard](${process.env.DASHBOARD_URL || "https://client.webolev.com"})`,
     { parse_mode: "Markdown" }
   );
 });
 
-scheduleDailyReminders();
+// ── Daily Reminders at 9am IST ────────────────────────────────────────────────
+function scheduleDailyReminders() {
+  const ist  = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const next = new Date(ist);
+  next.setHours(9, 0, 0, 0);
+  if (next <= ist) next.setDate(next.getDate() + 1);
+  setTimeout(() => {
+    sendDailyReminders();
+    setInterval(sendDailyReminders, 24 * 60 * 60 * 1000);
+  }, next - ist);
+}
 
-// ─── Express API ───────────────────────────────────────────────────────────────
+async function sendDailyReminders() {
+  const today     = todayIST();
+  const dueSnap   = await clientsCol.where("followUpDate", "==", today).get();
+  if (dueSnap.empty) return;
+  const usersSnap = await usersCol.where("status", "==", "approved").get();
+  const lines     = dueSnap.docs.map(d => {
+    const c = d.data();
+    return `• *${c.name}* — ${c.product}${c.followUpNote ? `\n  📌 ${c.followUpNote}` : ""}`;
+  });
+  usersSnap.docs.forEach(d => {
+    const u = d.data();
+    if (u.chatId) {
+      bot.sendMessage(u.chatId,
+        `🌅 *Good morning! Follow-ups today:*\n\n${lines.join("\n")}\n\nSend /reminders anytime.`,
+        { parse_mode: "Markdown" }
+      );
+    }
+  });
+}
+
+scheduleDailyReminders();
+console.log("✅ Telegram bot started");
+
+// ── Express API ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.get("/api/clients", async (req, res) => {
-  const page  = parseInt(req.query.page)  || 1;
-  const limit = parseInt(req.query.limit) || 50;
+// Auth middleware — verifies Firebase ID token
+async function authMiddleware(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header?.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const decoded = await admin.auth().verifyIdToken(header.split(" ")[1]);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
 
-  const [clients, total] = await Promise.all([
-    Client.find().sort({ createdAt: -1 }).skip((page-1)*limit).limit(limit),
-    Client.countDocuments()
-  ]);
+// GET clients (paginated + search + status filter)
+app.get("/api/clients", authMiddleware, async (req, res) => {
+  try {
+    const page   = parseInt(req.query.page)  || 1;
+    const limit  = parseInt(req.query.limit) || 100;
+    const search = req.query.search?.toLowerCase() || "";
+    const status = req.query.status || "";
 
-  res.json({ clients, total, page, pages: Math.ceil(total/limit) });
+    let query = clientsCol.orderBy("createdAt", "desc");
+    if (status && ["Hot","Cold","Closed"].includes(status)) {
+      query = query.where("status", "==", status);
+    }
+
+    const snap = await query.get();
+    let docs   = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    if (search) {
+      docs = docs.filter(c =>
+        c.name?.toLowerCase().includes(search) ||
+        c.number?.includes(search) ||
+        c.product?.toLowerCase().includes(search)
+      );
+    }
+
+    const total   = docs.length;
+    const clients = docs.slice((page - 1) * limit, page * limit);
+    res.json({ clients, total, page, pages: Math.ceil(total / limit) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get("/api/clients/download", async (req, res) => {
-  const excelPath = await rebuildExcel();
-  res.download(excelPath, "clients.xlsx");
+// GET today's follow-ups
+app.get("/api/followups/today", authMiddleware, async (req, res) => {
+  try {
+    const today = todayIST();
+    const snap  = await clientsCol.where("followUpDate", "==", today).get();
+    res.json({ due: snap.docs.map(d => ({ id: d.id, ...d.data() })), today });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get("/api/stats", async (req, res) => {
-  // All 7 queries run at the SAME TIME instead of one by one
-  const [total, products, hot, cold, closed, approved, pending] = await Promise.all([
-    Client.countDocuments(),
-    Client.distinct("product"),
-    Client.countDocuments({ status: "Hot" }),
-    Client.countDocuments({ status: "Cold" }),
-    Client.countDocuments({ status: "Closed" }),
-    User.countDocuments({ status: "approved" }),
-    User.countDocuments({ status: "pending" }),
-  ]);
-
-  res.set("Cache-Control", "public, max-age=30"); // browser caches for 30 seconds
-  res.json({
-    total, products,
-    byStatus: { Hot: hot, Cold: cold, Closed: closed },
-    approvedUsers: approved,
-    pendingUsers:  pending,
-  });
+// Download Excel
+app.get("/api/clients/download", authMiddleware, async (req, res) => {
+  try {
+    const excelPath = await rebuildExcel();
+    res.download(excelPath, "clients.xlsx");
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get("/api/users", async (req, res) => {
-  const approved = await User.find({ status: "approved" });
-  const pending  = await User.find({ status: "pending" });
-  res.json({ approved, pending });
+// GET stats — all 7 counts in parallel for speed
+app.get("/api/stats", authMiddleware, async (req, res) => {
+  try {
+    const [allSnap, hotSnap, coldSnap, closedSnap, usersSnap, pendingSnap, productsSnap] = await Promise.all([
+      clientsCol.count().get(),
+      clientsCol.where("status","==","Hot").count().get(),
+      clientsCol.where("status","==","Cold").count().get(),
+      clientsCol.where("status","==","Closed").count().get(),
+      usersCol.where("status","==","approved").count().get(),
+      usersCol.where("status","==","pending").count().get(),
+      clientsCol.select("product").get(),
+    ]);
+    const products = [...new Set(productsSnap.docs.map(d => d.data().product).filter(Boolean))];
+    res.set("Cache-Control", "public, max-age=30");
+    res.json({
+      total:        allSnap.data().count,
+      products,
+      byStatus:     { Hot: hotSnap.data().count, Cold: coldSnap.data().count, Closed: closedSnap.data().count },
+      approvedUsers: usersSnap.data().count,
+      pendingUsers:  pendingSnap.data().count,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch("/api/clients/:id", async (req, res) => {
-  const allowed = ["status","price","followUpDate","followUpNote","name","number","product"];
-  const update  = {};
-  allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
-  const c = await Client.findByIdAndUpdate(req.params.id, update, { new: true });
-  if (!c) return res.status(404).json({ error: "Not found" });
-  res.json(c);
+// GET users
+app.get("/api/users", authMiddleware, async (req, res) => {
+  try {
+    const snap     = await usersCol.get();
+    const approved = snap.docs.filter(d => d.data().status === "approved").map(d => ({ id: d.id, ...d.data() }));
+    const pending  = snap.docs.filter(d => d.data().status === "pending").map(d => ({ id: d.id, ...d.data() }));
+    res.json({ approved, pending });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/api/clients/:id/notes", async (req, res) => {
-  const c = await Client.findById(req.params.id);
-  if (!c) return res.status(404).json({ error: "Not found" });
-  c.notes.push({ text: req.body.text, by: req.body.by || "Dashboard", at: nowIST() });
-  await c.save();
-  res.json(c);
+// POST new client (from dashboard)
+app.post("/api/clients", authMiddleware, async (req, res) => {
+  try {
+    const { name, number, product, price, status, note, followUpDate, followUpNote, addedBy } = req.body;
+    if (!name || !number || !product) return res.status(400).json({ error: "name, number, product required" });
+    const now    = nowIST();
+    const docRef = clientsCol.doc();
+    const data   = {
+      name,
+      number:       normalizePhone(number),
+      product,
+      price:        price || "",
+      status:       ["Hot","Cold","Closed"].includes(status) ? status : "Hot",
+      notes:        note ? [{ text: note, by: addedBy || "Dashboard", at: now }] : [],
+      followUpDate: followUpDate || "",
+      followUpNote: followUpNote || "",
+      addedBy:      addedBy || req.user.email || "Dashboard",
+      addedOn:      now,
+      date:         todayIST(),
+      createdAt:    admin.firestore.FieldValue.serverTimestamp(),
+    };
+    await docRef.set(data);
+    res.status(201).json({ id: docRef.id, ...data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete("/api/clients/:id", async (req, res) => {
-  await Client.findByIdAndDelete(req.params.id);
-  res.json({ ok: true });
+// PATCH client
+app.patch("/api/clients/:id", authMiddleware, async (req, res) => {
+  try {
+    const allowed = ["status","price","followUpDate","followUpNote","name","number","product"];
+    const update  = {};
+    allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
+    if (Object.keys(update).length === 0) return res.status(400).json({ error: "Nothing to update" });
+    const docRef = clientsCol.doc(req.params.id);
+    await docRef.update(update);
+    const updated = await docRef.get();
+    res.json({ id: updated.id, ...updated.data() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/api/users/approve", async (req, res) => {
-  const { phone, name, chatId } = req.body;
-  if (!phone) return res.status(400).json({ error: "phone required" });
-  const u = await User.findOneAndUpdate(
-    { phone: normalizePhone(phone) },
-    { status: "approved", name: name || "User", chatId: chatId || null, addedAt: new Date() },
-    { upsert: true, new: true }
-  );
-  if (u.chatId) bot.sendMessage(u.chatId, "🎉 *You've been approved!* Send /help to start.", { parse_mode: "Markdown" });
-  res.json({ ok: true });
+// POST note to client
+app.post("/api/clients/:id/notes", authMiddleware, async (req, res) => {
+  try {
+    const docRef  = clientsCol.doc(req.params.id);
+    const docSnap = await docRef.get();
+    if (!docSnap.exists) return res.status(404).json({ error: "Not found" });
+    const notes = docSnap.data().notes || [];
+    notes.push({ text: req.body.text, by: req.body.by || req.user.email || "Dashboard", at: nowIST() });
+    await docRef.update({ notes });
+    const updated = await docRef.get();
+    res.json({ id: updated.id, ...updated.data() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete("/api/users/:phone", async (req, res) => {
-  const u = await User.findOneAndDelete({ phone: normalizePhone(req.params.phone) });
-  if (u?.chatId) bot.sendMessage(u.chatId, "ℹ️ Your access has been removed.");
-  res.json({ ok: true });
+// DELETE client
+app.delete("/api/clients/:id", authMiddleware, async (req, res) => {
+  try {
+    await clientsCol.doc(req.params.id).delete();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`✅ Server on http://localhost:${PORT}`));
+// Approve Telegram user
+app.post("/api/users/approve", authMiddleware, async (req, res) => {
+  try {
+    const { phone, name, chatId } = req.body;
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    const norm = normalizePhone(phone);
+    await usersCol.doc(norm).set(
+      { status: "approved", name: name || "User", chatId: chatId || null, addedAt: new Date().toISOString() },
+      { merge: true }
+    );
+    const docSnap = await usersCol.doc(norm).get();
+    if (docSnap.data()?.chatId) {
+      bot.sendMessage(docSnap.data().chatId, "🎉 *You've been approved!* Send /help to start.", { parse_mode: "Markdown" });
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Delete Telegram user
+app.delete("/api/users/:phone", authMiddleware, async (req, res) => {
+  try {
+    const norm    = normalizePhone(req.params.phone);
+    const docSnap = await usersCol.doc(norm).get();
+    if (docSnap.exists && docSnap.data().chatId) {
+      bot.sendMessage(docSnap.data().chatId, "ℹ️ Your access has been removed.");
+    }
+    await usersCol.doc(norm).delete();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.listen(PORT, () => console.log(`✅ API server on http://localhost:${PORT}`));
