@@ -6,6 +6,10 @@ const ExcelJS     = require("exceljs");
 const path        = require("path");
 const { admin, db } = require("./firebase");
 
+const rateLimit = require("express-rate-limit");
+const helmet    = require("helmet");
+
+
 // ── Config ────────────────────────────────────────────────────────────────────
 const TOKEN       = process.env.TELEGRAM_TOKEN;
 const ADMIN_PHONE = process.env.ADMIN_PHONE;
@@ -21,7 +25,12 @@ const usersCol   = db.collection("users");
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function nowIST()          { return new Date().toLocaleString("en-IN",     { timeZone: "Asia/Kolkata" }); }
 function todayIST()        { return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" }); }
-function normalizePhone(p) { return String(p).replace(/\D/g, ""); }
+
+function normalizePhone(p) {
+  const n = String(p).replace(/\D/g, "");
+  return (n.length >= 10 && n.length <= 15) ? n : null;
+}
+
 function isAdmin(phone)    { return normalizePhone(phone) === normalizePhone(ADMIN_PHONE); }
 function capitalize(s)     { if (!s) return s; return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase(); }
 
@@ -483,8 +492,14 @@ console.log("✅ Telegram bot started");
 
 // ── Express API ───────────────────────────────────────────────────────────────
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.use(helmet());
+app.use(cors({
+  origin: ["https://client.webolev.com", "http://localhost:5173"],
+  methods: ["GET","POST","PATCH","DELETE"],
+  allowedHeaders: ["Content-Type","Authorization"],
+}));
+app.use(express.json({ limit: "10kb" }));
+app.use("/api/", rateLimit({ windowMs: 15 * 60 * 1000, max: 300 }));
 
 // Auth middleware — verifies Firebase ID token
 async function authMiddleware(req, res, next) {
@@ -503,7 +518,7 @@ async function authMiddleware(req, res, next) {
 app.get("/api/clients", authMiddleware, async (req, res) => {
   try {
     const page   = parseInt(req.query.page)  || 1;
-    const limit  = parseInt(req.query.limit) || 100;
+    const limit  = Math.min(parseInt(req.query.limit) || 50, 200);
     const search = req.query.search?.toLowerCase() || "";
     const status = req.query.status || "";
 
@@ -585,11 +600,14 @@ app.post("/api/clients", authMiddleware, async (req, res) => {
   try {
     const { name, number, product, price, status, note, followUpDate, followUpNote, addedBy } = req.body;
     if (!name || !number || !product) return res.status(400).json({ error: "name, number, product required" });
+    if (name.length > 100 || product.length > 100) return res.status(400).json({ error: "Input too long" });
+    const num = normalizePhone(number); 
+    if (!num) return res.status(400).json({ error: "Invalid phone number" });
     const now    = nowIST();
     const docRef = clientsCol.doc();
     const data   = {
       name,
-      number:       normalizePhone(number),
+      number:         num,
       product,
       price:        price || "",
       status:       ["Hot","Cold","Closed"].includes(status) ? status : "Hot",
