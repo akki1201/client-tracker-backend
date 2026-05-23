@@ -184,7 +184,12 @@ async function rebuildExcel() {
 }
 
 // ── Telegram Bot ─────────────────────────────────────────────────────────────
-const bot = new TelegramBot(TOKEN, { polling: true });
+const bot = new TelegramBot(TOKEN, { 
+  polling: {
+    autoStart: true,
+    params: { timeout: 10 }
+  }
+});
 
 bot.on("polling_error", (err) => {
   console.error("Telegram polling error:", err.code, err.message);
