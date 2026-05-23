@@ -13,7 +13,7 @@ const TOKEN       = process.env.TELEGRAM_TOKEN;
 const ADMIN_PHONE = process.env.ADMIN_PHONE;
 const PORT        = process.env.PORT || 3001;
 
-// Validate all required env vars up front with clear error messages
+
 const REQUIRED_ENV = [
   "TELEGRAM_TOKEN",
   "ADMIN_PHONE",
@@ -27,11 +27,11 @@ if (missing.length) {
   process.exit(1);
 }
 
-// ── Firestore Collections ─────────────────────────────────────────────────────
+// ── Firestore Collections ────────────────────────────────────────────────────
 const clientsCol = db.collection("clients");
 const usersCol   = db.collection("users");
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 function nowIST()   { return new Date().toLocaleString("en-IN",     { timeZone: "Asia/Kolkata" }); }
 function todayIST() { return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" }); }
 
@@ -81,7 +81,7 @@ async function notifyAdmin(text) {
   }
 }
 
-// ── Smart Parser ──────────────────────────────────────────────────────────────
+// ── Smart Parser ─────────────────────────────────────────────────────────────
 function smartParse(text) {
   const fields = { status: "Hot" };
   const t = text.trim();
@@ -134,7 +134,7 @@ function smartParse(text) {
   return { fields, missing: ["name","number","product"], format: "unknown" };
 }
 
-// ── Excel Export ──────────────────────────────────────────────────────────────
+// ── Excel Export ─────────────────────────────────────────────────────────────
 async function rebuildExcel() {
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet("Clients");
@@ -183,13 +183,11 @@ async function rebuildExcel() {
   return excelPath;
 }
 
-// ── Telegram Bot ──────────────────────────────────────────────────────────────
+// ── Telegram Bot ─────────────────────────────────────────────────────────────
 const bot = new TelegramBot(TOKEN, { polling: true });
 
-// FIX: Handle polling errors — without this, a network blip crashes the process
 bot.on("polling_error", (err) => {
   console.error("Telegram polling error:", err.code, err.message);
-  // Don't exit — polling auto-recovers
 });
 
 bot.on("error", (err) => {
@@ -492,9 +490,18 @@ bot.on("message", async msg => {
       );
     }
 
-    const num = normalizePhone(fields.number);
+const num = normalizePhone(fields.number);
     if (!num) {
       return bot.sendMessage(msg.chat.id, "❌ Invalid phone number. Please check and try again.");
+    }
+
+    const dupSnap = await clientsCol.where("number", "==", num).limit(1).get();
+    if (!dupSnap.empty) {
+      const existing = dupSnap.docs[0].data();
+      return bot.sendMessage(msg.chat.id,
+        `⚠️ *Client already exists!*\n\n👤 ${existing.name} — ${existing.product}\n📞 ${num}\n\nUse /note ${num} to add a note.`,
+        { parse_mode: "Markdown" }
+      );
     }
 
     const now    = nowIST();
@@ -544,7 +551,6 @@ function scheduleDailyReminders() {
   }, next - ist);
 }
 
-// FIX: Wrapped in try/catch so a Firestore error doesn't crash the process
 async function sendDailyReminders() {
   try {
     const today     = todayIST();
@@ -574,6 +580,7 @@ console.log("✅ Telegram bot started");
 
 // ── Express API ───────────────────────────────────────────────────────────────
 const app = express();
+app.set('trust proxy', 1);
 app.use(helmet());
 
 const allowedOrigins = [
@@ -614,15 +621,66 @@ async function authMiddleware(req, res, next) {
   }
 }
 
-// GET clients
-app.get("/api/clients", authMiddleware, async (req, res) => {
+// ── FIX: Approved middleware ──────────────────────────────────────────────────
+// Prevents any Firebase user (even ones not in your users collection) from
+// accessing the API. Only approved users in Firestore can proceed.
+async function approvedMiddleware(req, res, next) {
+  try {
+    const email = req.user?.email;
+    const uid   = req.user?.uid;
+
+    if (!email && !uid) {
+      return res.status(403).json({ error: "Access denied." });
+    }
+
+    // Check if admin phone is approved (admin always gets through)
+    const adminPhone = normalizePhone(ADMIN_PHONE);
+    const adminSnap  = await usersCol
+      .where("phone",  "==", adminPhone)
+      .where("status", "==", "approved")
+      .limit(1).get();
+
+    if (!adminSnap.empty) {
+      const adminData = adminSnap.docs[0].data();
+      // If the token email matches the admin's stored email, let through
+      if (adminData.email === email) return next();
+    }
+
+    // Check by email stored in users collection
+    if (email) {
+      const emailSnap = await usersCol
+        .where("email",  "==", email)
+        .where("status", "==", "approved")
+        .limit(1).get();
+      if (!emailSnap.empty) return next();
+    }
+
+    // Check by Firebase UID stored in users collection
+    if (uid) {
+      const uidSnap = await usersCol
+        .where("uid",    "==", uid)
+        .where("status", "==", "approved")
+        .limit(1).get();
+      if (!uidSnap.empty) return next();
+    }
+
+    return res.status(403).json({ error: "Access denied. Not an approved user." });
+  } catch (e) {
+    console.error("approvedMiddleware error:", e.message);
+    res.status(500).json({ error: "Auth check failed" });
+  }
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+// NOTE: All sensitive routes now use BOTH authMiddleware AND approvedMiddleware
+
+app.get("/api/clients", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const page   = parseInt(req.query.page)  || 1;
     const limit  = Math.min(parseInt(req.query.limit) || 50, 200);
     const search = req.query.search?.toLowerCase() || "";
     const status = req.query.status || "";
 
-    // FIX: avoid composite index requirement — filter by status without orderBy, sort in memory
     let query;
     if (status && ["Hot","Cold","Closed"].includes(status)) {
       query = clientsCol.where("status", "==", status);
@@ -655,7 +713,7 @@ app.get("/api/clients", authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get("/api/followups/today", authMiddleware, async (req, res) => {
+app.get("/api/followups/today", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const today = todayIST();
     const snap  = await clientsCol.where("followUpDate", "==", today).get();
@@ -663,14 +721,14 @@ app.get("/api/followups/today", authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get("/api/clients/download", authMiddleware, async (req, res) => {
+app.get("/api/clients/download", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const excelPath = await rebuildExcel();
     res.download(excelPath, "clients.xlsx");
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get("/api/stats", authMiddleware, async (req, res) => {
+app.get("/api/stats", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const [allSnap, hotSnap, coldSnap, closedSnap, usersSnap, pendingSnap, productsSnap] = await Promise.all([
       clientsCol.count().get(),
@@ -693,7 +751,7 @@ app.get("/api/stats", authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get("/api/users", authMiddleware, async (req, res) => {
+app.get("/api/users", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const snap     = await usersCol.get();
     const approved = snap.docs.filter(d => d.data().status === "approved").map(d => ({ id: d.id, ...d.data() }));
@@ -702,13 +760,18 @@ app.get("/api/users", authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/api/clients", authMiddleware, async (req, res) => {
+app.post("/api/clients", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const { name, number, product, price, status, note, followUpDate, followUpNote, addedBy } = req.body;
     if (!name || !number || !product) return res.status(400).json({ error: "name, number, product required" });
     if (name.length > 100 || product.length > 100) return res.status(400).json({ error: "Input too long" });
     const num = normalizePhone(number);
     if (!num) return res.status(400).json({ error: "Invalid phone number" });
+
+
+const dupSnap = await clientsCol.where("number", "==", num).limit(1).get();
+if (!dupSnap.empty) return res.status(409).json({ error: "Client with this number already exists" });
+
     const now    = nowIST();
     const docRef = clientsCol.doc();
     const data   = {
@@ -728,7 +791,7 @@ app.post("/api/clients", authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch("/api/clients/:id", authMiddleware, async (req, res) => {
+app.patch("/api/clients/:id", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const allowed = ["status","price","followUpDate","followUpNote","name","number","product"];
     const update  = {};
@@ -741,7 +804,7 @@ app.patch("/api/clients/:id", authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/api/clients/:id/notes", authMiddleware, async (req, res) => {
+app.post("/api/clients/:id/notes", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const docRef  = clientsCol.doc(req.params.id);
     const docSnap = await docRef.get();
@@ -754,14 +817,14 @@ app.post("/api/clients/:id/notes", authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete("/api/clients/:id", authMiddleware, async (req, res) => {
+app.delete("/api/clients/:id", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     await clientsCol.doc(req.params.id).delete();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/api/users/approve", authMiddleware, async (req, res) => {
+app.post("/api/users/approve", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const { phone, name, chatId } = req.body;
     if (!phone) return res.status(400).json({ error: "phone required" });
@@ -779,7 +842,7 @@ app.post("/api/users/approve", authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete("/api/users/:phone", authMiddleware, async (req, res) => {
+app.delete("/api/users/:phone", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const norm = normalizePhone(req.params.phone);
     if (!norm) return res.status(400).json({ error: "Invalid phone" });
@@ -799,7 +862,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
-// ── Uncaught exception safety net ─────────────────────────────────────────────
+// ── Uncaught exception safety net ────────────────────────────────────────────
 process.on("uncaughtException",  e => console.error("Uncaught exception:", e.message));
 process.on("unhandledRejection", e => console.error("Unhandled rejection:", e));
 
