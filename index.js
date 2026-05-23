@@ -626,49 +626,20 @@ async function authMiddleware(req, res, next) {
   }
 }
 
-// ── FIX: Approved middleware ──────────────────────────────────────────────────
+// ── Approved middleware ──────────────────────────────────────────────────
 // Prevents any Firebase user (even ones not in your users collection) from
 // accessing the API. Only approved users in Firestore can proceed.
 async function approvedMiddleware(req, res, next) {
-  return next();
   try {
     const email = req.user?.email;
-    const uid   = req.user?.uid;
+    if (!email) return res.status(403).json({ error: "Access denied." });
 
-    if (!email && !uid) {
-      return res.status(403).json({ error: "Access denied." });
-    }
-
-    // Check if admin phone is approved (admin always gets through)
-    const adminPhone = normalizePhone(ADMIN_PHONE);
-    const adminSnap  = await usersCol
-      .where("phone",  "==", adminPhone)
+    const snap = await usersCol
+      .where("email", "==", email)
       .where("status", "==", "approved")
       .limit(1).get();
 
-    if (!adminSnap.empty) {
-      const adminData = adminSnap.docs[0].data();
-      // If the token email matches the admin's stored email, let through
-      if (adminData.email === email) return next();
-    }
-
-    // Check by email stored in users collection
-    if (email) {
-      const emailSnap = await usersCol
-        .where("email",  "==", email)
-        .where("status", "==", "approved")
-        .limit(1).get();
-      if (!emailSnap.empty) return next();
-    }
-
-    // Check by Firebase UID stored in users collection
-    if (uid) {
-      const uidSnap = await usersCol
-        .where("uid",    "==", uid)
-        .where("status", "==", "approved")
-        .limit(1).get();
-      if (!uidSnap.empty) return next();
-    }
+    if (!snap.empty) return next();
 
     return res.status(403).json({ error: "Access denied. Not an approved user." });
   } catch (e) {
