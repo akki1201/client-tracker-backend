@@ -632,14 +632,26 @@ async function authMiddleware(req, res, next) {
 async function approvedMiddleware(req, res, next) {
   try {
     const email = req.user?.email;
-    if (!email) return res.status(403).json({ error: "Access denied." });
+    const uid   = req.user?.uid;
+    if (!email && !uid) return res.status(403).json({ error: "Access denied." });
 
-    const snap = await usersCol
-      .where("email", "==", email)
-      .where("status", "==", "approved")
-      .limit(1).get();
+    // Check by email first (dashboard users)
+    if (email) {
+      const byEmail = await usersCol
+        .where("email", "==", email)
+        .where("status", "==", "approved")
+        .limit(1).get();
+      if (!byEmail.empty) return next();
+    }
 
-    if (!snap.empty) return next();
+    // Fallback: check by uid (Firebase UID stored on user doc)
+    if (uid) {
+      const byUid = await usersCol
+        .where("uid", "==", uid)
+        .where("status", "==", "approved")
+        .limit(1).get();
+      if (!byUid.empty) return next();
+    }
 
     return res.status(403).json({ error: "Access denied. Not an approved user." });
   } catch (e) {
@@ -650,31 +662,21 @@ async function approvedMiddleware(req, res, next) {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 // NOTE: All sensitive routes now use BOTH authMiddleware AND approvedMiddleware
-
 app.get("/api/clients", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
-    const page   = parseInt(req.query.page)  || 1;
-    const limit  = Math.min(parseInt(req.query.limit) || 50, 200);
+    const page  = parseInt(req.query.page)  || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 100, 200);
     const search = req.query.search?.toLowerCase() || "";
     const status = req.query.status || "";
 
-    let query;
+    // Always query ordered by createdAt desc — no JS sort needed
+    let query = clientsCol.orderBy("createdAt", "desc");
     if (status && ["Hot","Cold","Closed"].includes(status)) {
-      query = clientsCol.where("status", "==", status);
-    } else {
-      query = clientsCol.orderBy("createdAt", "desc");
+      query = clientsCol.where("status", "==", status).orderBy("createdAt", "desc");
     }
 
     const snap = await query.get();
     let docs   = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-    if (status) {
-      docs.sort((a, b) => {
-        const ta = a.createdAt?.toMillis?.() ?? 0;
-        const tb = b.createdAt?.toMillis?.() ?? 0;
-        return tb - ta;
-      });
-    }
 
     if (search) {
       docs = docs.filter(c =>
@@ -686,7 +688,56 @@ app.get("/api/clients", authMiddleware, approvedMiddleware, async (req, res) => 
 
     const total   = docs.length;
     const clients = docs.slice((page - 1) * limit, page * limit);
+    res.set("Cache-Control", "private, max-age=20");
     res.json({ clients, total, page, pages: Math.ceil(total / limit) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// Frontend calls this on initial load instead of two separate calls
+app.get("/api/dashboard", authMiddleware, approvedMiddleware, async (req, res) => {
+  try {
+    const page  = parseInt(req.query.page)  || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 100, 200);
+
+    const [
+      clientsSnap,
+      hotSnap, coldSnap, closedSnap,
+      usersSnap, pendingSnap,
+      productsSnap,
+    ] = await Promise.all([
+      clientsCol.orderBy("createdAt", "desc").get(),
+      clientsCol.where("status", "==", "Hot").count().get(),
+      clientsCol.where("status", "==", "Cold").count().get(),
+      clientsCol.where("status", "==", "Closed").count().get(),
+      usersCol.where("status", "==", "approved").count().get(),
+      usersCol.where("status", "==", "pending").count().get(),
+      clientsCol.select("product").get(),
+    ]);
+
+    const allDocs  = clientsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const total    = allDocs.length;
+    const clients  = allDocs.slice((page - 1) * limit, page * limit);
+    const products = [...new Set(productsSnap.docs.map(d => d.data().product).filter(Boolean))];
+
+    res.set("Cache-Control", "private, max-age=20");
+    res.json({
+      clients,
+      total,
+      page,
+      pages: Math.ceil(total / limit),
+      stats: {
+        total,
+        products,
+        byStatus: {
+          Hot:    hotSnap.data().count,
+          Cold:   coldSnap.data().count,
+          Closed: closedSnap.data().count,
+        },
+        approvedUsers: usersSnap.data().count,
+        pendingUsers:  pendingSnap.data().count,
+      },
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -717,7 +768,7 @@ app.get("/api/stats", authMiddleware, approvedMiddleware, async (req, res) => {
       clientsCol.select("product").get(),
     ]);
     const products = [...new Set(productsSnap.docs.map(d => d.data().product).filter(Boolean))];
-    res.set("Cache-Control", "public, max-age=30");
+    res.set("Cache-Control", "private, max-age=30");
     res.json({
       total:         allSnap.data().count,
       products,
@@ -775,23 +826,38 @@ app.patch("/api/clients/:id", authMiddleware, approvedMiddleware, async (req, re
     allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
     if (Object.keys(update).length === 0) return res.status(400).json({ error: "Nothing to update" });
     const docRef = clientsCol.doc(req.params.id);
-    await docRef.update(update);
-    const updated = await docRef.get();
-    res.json({ id: updated.id, ...updated.data() });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    // Use transaction so we read+write in one round trip instead of two
+    const result = await db.runTransaction(async t => {
+      const snap = await t.get(docRef);
+      if (!snap.exists) throw new Error("Not found");
+      t.update(docRef, update);
+      return { id: snap.id, ...snap.data(), ...update };
+    });
+    res.json(result);
+  } catch (e) {
+    if (e.message === "Not found") return res.status(404).json({ error: "Client not found" });
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/api/clients/:id/notes", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
-    const docRef  = clientsCol.doc(req.params.id);
-    const docSnap = await docRef.get();
-    if (!docSnap.exists) return res.status(404).json({ error: "Not found" });
-    const notes = docSnap.data().notes || [];
-    notes.push({ text: req.body.text, by: req.body.by || req.user.email || "Dashboard", at: nowIST() });
-    await docRef.update({ notes });
-    const updated = await docRef.get();
-    res.json({ id: updated.id, ...updated.data() });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { text, by } = req.body;
+    if (!text?.trim()) return res.status(400).json({ error: "Note text required" });
+    const docRef = clientsCol.doc(req.params.id);
+    const result = await db.runTransaction(async t => {
+      const snap = await t.get(docRef);
+      if (!snap.exists) throw new Error("Not found");
+      const notes = [...(snap.data().notes || [])];
+      notes.push({ text, by: by || req.user.email || "Dashboard", at: nowIST() });
+      t.update(docRef, { notes });
+      return { id: snap.id, ...snap.data(), notes };
+    });
+    res.json(result);
+  } catch (e) {
+    if (e.message === "Not found") return res.status(404).json({ error: "Client not found" });
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.delete("/api/clients/:id", authMiddleware, approvedMiddleware, async (req, res) => {
