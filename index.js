@@ -905,6 +905,136 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
+// ════════════════════════════════════════════════════════════════
+// VAULT — Secure Password Store
+// ════════════════════════════════════════════════════════════════
+const crypto  = require("crypto");
+const jwt     = require("jsonwebtoken");
+
+const VAULT_OTP     = process.env.VAULT_OTP;
+const VAULT_SECRET  = process.env.VAULT_JWT_SECRET;
+const VAULT_ENC_KEY = process.env.VAULT_ENCRYPT_KEY; // must be 32 chars
+const vaultCol      = db.collection("vault");
+
+// ── Encrypt / Decrypt ─────────────────────────────────────────
+function encrypt(text) {
+  const iv  = crypto.randomBytes(16);
+  const key = Buffer.from(VAULT_ENC_KEY.padEnd(32).slice(0, 32));
+  const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+  const encrypted = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+  return iv.toString("hex") + ":" + encrypted.toString("hex");
+}
+
+function decrypt(data) {
+  const [ivHex, encHex] = data.split(":");
+  const iv  = Buffer.from(ivHex, "hex");
+  const key = Buffer.from(VAULT_ENC_KEY.padEnd(32).slice(0, 32));
+  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+  const dec = Buffer.concat([decipher.update(Buffer.from(encHex, "hex")), decipher.final()]);
+  return dec.toString("utf8");
+}
+
+// ── Vault JWT middleware ───────────────────────────────────────
+function vaultAuth(req, res, next) {
+  const header = req.headers["x-vault-token"];
+  if (!header) return res.status(401).json({ error: "Vault token required" });
+  try {
+    req.vault = jwt.verify(header, VAULT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid or expired vault token" });
+  }
+}
+
+// ── POST /api/vault/verify — check OTP, return vault JWT ──────
+app.post("/api/vault/verify", authMiddleware, (req, res) => {
+  if (!VAULT_OTP || !VAULT_SECRET || !VAULT_ENC_KEY) {
+    return res.status(500).json({ error: "Vault not configured" });
+  }
+  const { otp } = req.body;
+  if (!otp || String(otp).trim() !== String(VAULT_OTP).trim()) {
+    return res.status(403).json({ error: "Invalid OTP" });
+  }
+  const token = jwt.sign(
+    { uid: req.user.uid, vault: true },
+    VAULT_SECRET,
+    { expiresIn: "1h" }
+  );
+  res.json({ token });
+});
+
+// ── GET /api/vault/entries — list all decrypted entries ───────
+app.get("/api/vault/entries", authMiddleware, vaultAuth, async (req, res) => {
+  try {
+    const snap    = await vaultCol.orderBy("createdAt", "desc").get();
+    const entries = snap.docs.map(d => {
+      const data = d.data();
+      return {
+        id:        d.id,
+        title:     data.title,
+        username:  data.username  ? decrypt(data.username)  : "",
+        password:  data.password  ? decrypt(data.password)  : "",
+        url:       data.url       ? decrypt(data.url)       : "",
+        note:      data.note      ? decrypt(data.note)      : "",
+        createdAt: data.createdAt,
+        updatedAt: data.updatedAt,
+      };
+    });
+    res.json({ entries });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/vault/entries — save new entry ──────────────────
+app.post("/api/vault/entries", authMiddleware, vaultAuth, async (req, res) => {
+  try {
+    const { title, username, password, url, note } = req.body;
+    if (!title?.trim()) return res.status(400).json({ error: "Title required" });
+    const now  = admin.firestore.FieldValue.serverTimestamp();
+    const data = {
+      title:    title.trim(),
+      username: username ? encrypt(username) : "",
+      password: password ? encrypt(password) : "",
+      url:      url      ? encrypt(url)      : "",
+      note:     note     ? encrypt(note)     : "",
+      addedBy:  req.user.uid,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const ref = vaultCol.doc();
+    await ref.set(data);
+    res.status(201).json({
+      id: ref.id, title,
+      username: username || "",
+      password: password || "",
+      url: url || "", note: note || "",
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PATCH /api/vault/entries/:id — update entry ───────────────
+app.patch("/api/vault/entries/:id", authMiddleware, vaultAuth, async (req, res) => {
+  try {
+    const { title, username, password, url, note } = req.body;
+    const update = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    if (title    !== undefined) update.title    = title.trim();
+    if (username !== undefined) update.username = username ? encrypt(username) : "";
+    if (password !== undefined) update.password = password ? encrypt(password) : "";
+    if (url      !== undefined) update.url      = url      ? encrypt(url)      : "";
+    if (note     !== undefined) update.note     = note     ? encrypt(note)     : "";
+    await vaultCol.doc(req.params.id).update(update);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DELETE /api/vault/entries/:id — delete entry ──────────────
+app.delete("/api/vault/entries/:id", authMiddleware, vaultAuth, async (req, res) => {
+  try {
+    await vaultCol.doc(req.params.id).delete();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
 // ── Uncaught exception safety net ────────────────────────────────────────────
 process.on("uncaughtException",  e => console.error("Uncaught exception:", e.message));
 process.on("unhandledRejection", e => console.error("Unhandled rejection:", e));
