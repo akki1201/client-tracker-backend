@@ -601,7 +601,7 @@ app.use(cors({
     cb(new Error(`CORS blocked: ${origin}`));
   },
   methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization"],
+  allowedHeaders: ["Content-Type","Authorization","x-vault-token"],
   credentials: true,
 }));
 
