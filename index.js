@@ -30,6 +30,8 @@ if (missing.length) {
 // ── Firestore Collections ────────────────────────────────────────────────────
 const clientsCol = db.collection("clients");
 const usersCol   = db.collection("users");
+const machinesCol = db.collection("machines");
+
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function nowIST()   { return new Date().toLocaleString("en-IN",     { timeZone: "Asia/Kolkata" }); }
@@ -898,13 +900,6 @@ app.delete("/api/users/:phone", authMiddleware, approvedMiddleware, async (req, 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Global error handler ──────────────────────────────────────────────────────
-app.use((err, req, res, next) => {
-  console.error("Express error:", err.message);
-  if (err.message?.includes("CORS")) return res.status(403).json({ error: "CORS blocked" });
-  res.status(500).json({ error: "Internal server error" });
-});
-
 
 // ── GET /api/machines ─────────────────────────────────────────────
 app.get("/api/machines", authMiddleware, approvedMiddleware, async (req, res) => {
@@ -1111,6 +1106,16 @@ app.delete("/api/vault/entries/:id", authMiddleware, vaultAuth, async (req, res)
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+
+// ── Global error handler ──────────────────────────────────────────────────────
+app.use((err, req, res, next) => {
+  console.error("Express error:", err.message);
+  if (err.message?.includes("CORS")) return res.status(403).json({ error: "CORS blocked" });
+  res.status(500).json({ error: "Internal server error" });
+});
+
+
 
 
 // ── Uncaught exception safety net ────────────────────────────────────────────
