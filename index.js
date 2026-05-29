@@ -905,6 +905,84 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
+
+// ── GET /api/machines ─────────────────────────────────────────────
+app.get("/api/machines", authMiddleware, approvedMiddleware, async (req, res) => {
+  try {
+    const snap = await machinesCol.orderBy("createdAt", "asc").get();
+    const machines = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.set("Cache-Control", "private, max-age=30");
+    res.json({ machines });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/machines ────────────────────────────────────────────
+app.post("/api/machines", authMiddleware, approvedMiddleware, async (req, res) => {
+  try {
+    const { name, category, power, notes, variants } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: "name required" });
+
+    // variants: [{ label, capacity, size, price }]
+    const cleanVariants = Array.isArray(variants)
+      ? variants.map(v => ({
+          id:       v.id || `v_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+          label:    v.label    || "",
+          capacity: v.capacity || "",
+          size:     v.size     || "",
+          price:    v.price    || "",
+        }))
+      : [];
+
+    const docRef = machinesCol.doc();
+    const data = {
+      name:      name.trim(),
+      category:  category  || "",
+      power:     power     || "",
+      notes:     notes     || "",
+      variants:  cleanVariants,
+      addedBy:   req.user.email || "Dashboard",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    await docRef.set(data);
+    res.status(201).json({ id: docRef.id, ...data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PATCH /api/machines/:id ───────────────────────────────────────
+app.patch("/api/machines/:id", authMiddleware, approvedMiddleware, async (req, res) => {
+  try {
+    const { name, category, power, notes, variants } = req.body;
+    const update = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    if (name      !== undefined) update.name     = name.trim();
+    if (category  !== undefined) update.category = category;
+    if (power     !== undefined) update.power    = power;
+    if (notes     !== undefined) update.notes    = notes;
+    if (variants  !== undefined) {
+      update.variants = variants.map(v => ({
+        id:       v.id || `v_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+        label:    v.label    || "",
+        capacity: v.capacity || "",
+        size:     v.size     || "",
+        price:    v.price    || "",
+      }));
+    }
+    const docRef = machinesCol.doc(req.params.id);
+    const snap   = await docRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Machine not found" });
+    await docRef.update(update);
+    res.json({ id: snap.id, ...snap.data(), ...update });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DELETE /api/machines/:id ──────────────────────────────────────
+app.delete("/api/machines/:id", authMiddleware, approvedMiddleware, async (req, res) => {
+  try {
+    await machinesCol.doc(req.params.id).delete();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ════════════════════════════════════════════════════════════════
 // VAULT — Secure Password Store
 // ════════════════════════════════════════════════════════════════
