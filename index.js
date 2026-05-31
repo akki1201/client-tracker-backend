@@ -4,22 +4,20 @@ const cors        = require("cors");
 const TelegramBot = require("node-telegram-bot-api");
 const ExcelJS     = require("exceljs");
 const path        = require("path");
+const crypto      = require("crypto");
+const jwt         = require("jsonwebtoken");
 const { admin, db } = require("./firebase");
 const rateLimit   = require("express-rate-limit");
 const helmet      = require("helmet");
 
-// ── Config ────────────────────────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────
 const TOKEN       = process.env.TELEGRAM_TOKEN;
 const ADMIN_PHONE = process.env.ADMIN_PHONE;
 const PORT        = process.env.PORT || 3001;
 
-
 const REQUIRED_ENV = [
-  "TELEGRAM_TOKEN",
-  "ADMIN_PHONE",
-  "FIREBASE_PROJECT_ID",
-  "FIREBASE_PRIVATE_KEY",
-  "FIREBASE_CLIENT_EMAIL",
+  "TELEGRAM_TOKEN", "ADMIN_PHONE",
+  "FIREBASE_PROJECT_ID", "FIREBASE_PRIVATE_KEY", "FIREBASE_CLIENT_EMAIL",
 ];
 const missing = REQUIRED_ENV.filter(k => !process.env[k]);
 if (missing.length) {
@@ -27,13 +25,19 @@ if (missing.length) {
   process.exit(1);
 }
 
-// ── Firestore Collections ────────────────────────────────────────────────────
-const clientsCol = db.collection("clients");
-const usersCol   = db.collection("users");
-const machinesCol = db.collection("machines");
+// ── Firestore Collections ─────────────────────────────────────────────
+const clientsCol     = db.collection("clients");
+const usersCol       = db.collection("users");
+const machinesCol    = db.collection("machines");
+const contractorsCol = db.collection("contractors");
+const vaultCol       = db.collection("vault");
 
+// ── Vault config ──────────────────────────────────────────────────────
+const VAULT_OTP     = process.env.VAULT_OTP;
+const VAULT_SECRET  = process.env.VAULT_JWT_SECRET;
+const VAULT_ENC_KEY = process.env.VAULT_ENCRYPT_KEY;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────
 function nowIST()   { return new Date().toLocaleString("en-IN",     { timeZone: "Asia/Kolkata" }); }
 function todayIST() { return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" }); }
 
@@ -53,13 +57,30 @@ function capitalize(s) {
   return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
 }
 
+// ── FIX #5: Telegram bot user cache ──────────────────────────────────
+// Before: every bot message → 1 Firestore read to verify user.
+// Now: cache approved users by chatId for 5 minutes.
+// On approve/remove, the entry is cleared immediately.
+const _botUserCache = new Map(); // chatId → { user, at }
+const BOT_USER_TTL  = 5 * 60_000;
+
 async function getApprovedByChatId(chatId) {
+  const id    = Number(chatId);
+  const entry = _botUserCache.get(id);
+  if (entry && (Date.now() - entry.at < BOT_USER_TTL)) return entry.user;
+
   const snap = await usersCol
-    .where("chatId", "==", Number(chatId))
+    .where("chatId", "==", id)
     .where("status", "==", "approved")
     .limit(1)
     .get();
-  return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
+  const user = snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
+  _botUserCache.set(id, { user, at: Date.now() });
+  return user;
+}
+
+function clearBotUserCache(chatId) {
+  if (chatId) _botUserCache.delete(Number(chatId));
 }
 
 let _adminChatIdCache = null;
@@ -78,12 +99,39 @@ async function notifyAdmin(text) {
   try {
     const chatId = await getAdminChatId();
     if (chatId) bot.sendMessage(chatId, text, { parse_mode: "Markdown" });
-  } catch (e) {
-    console.error("notifyAdmin failed:", e.message);
-  }
+  } catch (e) { console.error("notifyAdmin failed:", e.message); }
 }
 
-// ── Smart Parser ─────────────────────────────────────────────────────────────
+// ── FIX #2: approvedMiddleware cache ─────────────────────────────────
+// Before: every API request → 1-2 Firestore reads just to check if user is approved.
+// Now: cache result per uid/email for 5 minutes.
+// On user remove via API, cache is cleared immediately.
+const _approvedCache = new Map(); // uid → { approved, at }
+const APPROVED_TTL   = 5 * 60_000;
+
+function clearApprovedCache(uid) {
+  if (uid) _approvedCache.delete(uid);
+}
+
+// ── Vault encrypt/decrypt ─────────────────────────────────────────────
+function encrypt(text) {
+  const iv      = crypto.randomBytes(16);
+  const key     = Buffer.from(VAULT_ENC_KEY.padEnd(32).slice(0, 32));
+  const cipher  = crypto.createCipheriv("aes-256-cbc", key, iv);
+  const encrypted = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+  return iv.toString("hex") + ":" + encrypted.toString("hex");
+}
+
+function decrypt(data) {
+  const [ivHex, encHex] = data.split(":");
+  const iv      = Buffer.from(ivHex, "hex");
+  const key     = Buffer.from(VAULT_ENC_KEY.padEnd(32).slice(0, 32));
+  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+  const dec = Buffer.concat([decipher.update(Buffer.from(encHex, "hex")), decipher.final()]);
+  return dec.toString("utf8");
+}
+
+// ── Smart Parser ──────────────────────────────────────────────────────
 function smartParse(text) {
   const fields = { status: "Hot" };
   const t = text.trim();
@@ -136,7 +184,7 @@ function smartParse(text) {
   return { fields, missing: ["name","number","product"], format: "unknown" };
 }
 
-// ── Excel Export ─────────────────────────────────────────────────────────────
+// ── Excel Export ──────────────────────────────────────────────────────
 async function rebuildExcel() {
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet("Clients");
@@ -185,21 +233,13 @@ async function rebuildExcel() {
   return excelPath;
 }
 
-// ── Telegram Bot ─────────────────────────────────────────────────────────────
-const bot = new TelegramBot(TOKEN, { 
-  polling: {
-    autoStart: true,
-    params: { timeout: 10 }
-  }
+// ── Telegram Bot ──────────────────────────────────────────────────────
+const bot = new TelegramBot(TOKEN, {
+  polling: { autoStart: true, params: { timeout: 10 } }
 });
 
-bot.on("polling_error", (err) => {
-  console.error("Telegram polling error:", err.code, err.message);
-});
-
-bot.on("error", (err) => {
-  console.error("Telegram bot error:", err.message);
-});
+bot.on("polling_error", err => console.error("Telegram polling error:", err.code, err.message));
+bot.on("error",         err => console.error("Telegram bot error:", err.message));
 
 bot.onText(/\/start/, async msg => {
   try {
@@ -230,9 +270,7 @@ bot.on("contact", async msg => {
     const name    = [contact.first_name, contact.last_name].filter(Boolean).join(" ");
     const chatId  = Number(msg.chat.id);
 
-    if (!phone) {
-      return bot.sendMessage(chatId, "❌ Invalid phone number. Please try again.");
-    }
+    if (!phone) return bot.sendMessage(chatId, "❌ Invalid phone number. Please try again.");
 
     if (isAdmin(phone)) {
       _adminChatIdCache = chatId;
@@ -240,6 +278,8 @@ bot.on("contact", async msg => {
         { phone, name, chatId, status: "approved", addedAt: new Date().toISOString() },
         { merge: true }
       );
+      // Warm the cache immediately
+      _botUserCache.set(chatId, { user: { phone, name, chatId, status: "approved" }, at: Date.now() });
       return bot.sendMessage(chatId,
         `✅ *Welcome, ${name}! You're the admin.*\n\n` +
         "📌 *3 ways to add a client:*\n\n" +
@@ -252,12 +292,12 @@ bot.on("contact", async msg => {
     }
 
     const existingSnap = await usersCol
-      .where("phone", "==", phone)
-      .where("status", "==", "approved")
-      .limit(1).get();
+      .where("phone", "==", phone).where("status", "==", "approved").limit(1).get();
 
     if (!existingSnap.empty) {
       await usersCol.doc(phone).set({ chatId }, { merge: true });
+      const userData = { ...existingSnap.docs[0].data(), chatId };
+      _botUserCache.set(chatId, { user: userData, at: Date.now() });
       return bot.sendMessage(chatId,
         "✅ *You already have access!*\n\nSend /help to get started.",
         { parse_mode: "Markdown", reply_markup: { remove_keyboard: true } }
@@ -437,7 +477,10 @@ bot.onText(/\/adduser (.+)/, async (msg, match) => {
     );
     bot.sendMessage(msg.chat.id, `✅ +${phone} approved!`);
     if (docSnap.exists && docSnap.data().chatId) {
-      bot.sendMessage(docSnap.data().chatId, "🎉 *You've been approved!* Send /help to get started.", { parse_mode: "Markdown" });
+      const approvedChatId = docSnap.data().chatId;
+      // Clear stale cache so next message gets fresh approved status
+      clearBotUserCache(approvedChatId);
+      bot.sendMessage(approvedChatId, "🎉 *You've been approved!* Send /help to get started.", { parse_mode: "Markdown" });
     }
   } catch (e) { console.error("/adduser error:", e.message); }
 });
@@ -452,6 +495,7 @@ bot.onText(/\/removeuser (.+)/, async (msg, match) => {
     if (!docSnap.exists) return bot.sendMessage(msg.chat.id, "⚠️ User not found.");
     const u = docSnap.data();
     await usersCol.doc(phone).delete();
+    clearBotUserCache(u.chatId); // clear cache immediately on remove
     bot.sendMessage(msg.chat.id, `🗑 ${u.name} removed.`);
     if (u.chatId) bot.sendMessage(u.chatId, "ℹ️ Your access has been removed.");
   } catch (e) { console.error("/removeuser error:", e.message); }
@@ -497,10 +541,8 @@ bot.on("message", async msg => {
       );
     }
 
-const num = normalizePhone(fields.number);
-    if (!num) {
-      return bot.sendMessage(msg.chat.id, "❌ Invalid phone number. Please check and try again.");
-    }
+    const num = normalizePhone(fields.number);
+    if (!num) return bot.sendMessage(msg.chat.id, "❌ Invalid phone number. Please check and try again.");
 
     const dupSnap = await clientsCol.where("number", "==", num).limit(1).get();
     if (!dupSnap.empty) {
@@ -546,7 +588,7 @@ const num = normalizePhone(fields.number);
   } catch (e) { console.error("message handler error:", e.message); }
 });
 
-// ── Daily Reminders ───────────────────────────────────────────────────────────
+// ── Daily Reminders ───────────────────────────────────────────────────
 function scheduleDailyReminders() {
   const ist  = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
   const next = new Date(ist);
@@ -577,17 +619,15 @@ async function sendDailyReminders() {
         ).catch(e => console.error("sendDailyReminders sendMessage failed:", e.message));
       }
     });
-  } catch (e) {
-    console.error("sendDailyReminders error:", e.message);
-  }
+  } catch (e) { console.error("sendDailyReminders error:", e.message); }
 }
 
 scheduleDailyReminders();
 console.log("✅ Telegram bot started");
 
-// ── Express API ───────────────────────────────────────────────────────────────
+// ── Express API ───────────────────────────────────────────────────────
 const app = express();
-app.set('trust proxy', 1);
+app.set("trust proxy", 1);
 app.use(helmet());
 
 const allowedOrigins = [
@@ -610,12 +650,10 @@ app.use(cors({
 app.use(express.json({ limit: "10kb" }));
 app.use("/api/", rateLimit({ windowMs: 15 * 60 * 1000, max: 300 }));
 
-// ── Health check ──────────────────────────────────────────────────────────────
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", ts: Date.now() });
-});
+// ── Health check ──────────────────────────────────────────────────────
+app.get("/health", (req, res) => res.json({ status: "ok", ts: Date.now() }));
 
-// ── Auth middleware ───────────────────────────────────────────────────────────
+// ── Auth middleware ───────────────────────────────────────────────────
 async function authMiddleware(req, res, next) {
   const header = req.headers.authorization;
   if (!header?.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
@@ -628,33 +666,37 @@ async function authMiddleware(req, res, next) {
   }
 }
 
-// ── Approved middleware ──────────────────────────────────────────────────
-// Prevents any Firebase user (even ones not in your users collection) from
-// accessing the API. Only approved users in Firestore can proceed.
+// ── FIX #2: Approved middleware with in-memory cache ──────────────────
+// Before: 1-2 Firestore reads on EVERY API call.
+// Now: 1 read per user per 5 minutes. Cache is cleared on user remove.
 async function approvedMiddleware(req, res, next) {
   try {
-    const email = req.user?.email;
     const uid   = req.user?.uid;
-    if (!email && !uid) return res.status(403).json({ error: "Access denied." });
+    const email = req.user?.email;
+    if (!uid && !email) return res.status(403).json({ error: "Access denied." });
 
-    // Check by email first (dashboard users)
+    // Check cache first
+    const cached = _approvedCache.get(uid);
+    if (cached && (Date.now() - cached.at < APPROVED_TTL)) {
+      if (cached.approved) return next();
+      return res.status(403).json({ error: "Access denied. Not an approved user." });
+    }
+
+    // Cache miss — hit Firestore once
+    let approved = false;
     if (email) {
       const byEmail = await usersCol
-        .where("email", "==", email)
-        .where("status", "==", "approved")
-        .limit(1).get();
-      if (!byEmail.empty) return next();
+        .where("email", "==", email).where("status", "==", "approved").limit(1).get();
+      if (!byEmail.empty) approved = true;
     }
-
-    // Fallback: check by uid (Firebase UID stored on user doc)
-    if (uid) {
+    if (!approved && uid) {
       const byUid = await usersCol
-        .where("uid", "==", uid)
-        .where("status", "==", "approved")
-        .limit(1).get();
-      if (!byUid.empty) return next();
+        .where("uid", "==", uid).where("status", "==", "approved").limit(1).get();
+      if (!byUid.empty) approved = true;
     }
 
+    _approvedCache.set(uid, { approved, at: Date.now() });
+    if (approved) return next();
     return res.status(403).json({ error: "Access denied. Not an approved user." });
   } catch (e) {
     console.error("approvedMiddleware error:", e.message);
@@ -662,16 +704,69 @@ async function approvedMiddleware(req, res, next) {
   }
 }
 
-// ── Routes ────────────────────────────────────────────────────────────────────
-// NOTE: All sensitive routes now use BOTH authMiddleware AND approvedMiddleware
-app.get("/api/clients", authMiddleware, approvedMiddleware, async (req, res) => {
+// ── Vault JWT middleware ──────────────────────────────────────────────
+function vaultAuth(req, res, next) {
+  const header = req.headers["x-vault-token"];
+  if (!header) return res.status(401).json({ error: "Vault token required" });
+  try {
+    req.vault = jwt.verify(header, VAULT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid or expired vault token" });
+  }
+}
+
+// ── FIX #1: /api/dashboard — single call replaces /api/clients + /api/stats ──
+// Frontend useClients.js now calls this endpoint only, cutting initial
+// Firestore reads in half (was 2 HTTP requests + 7 Firestore ops each load).
+app.get("/api/dashboard", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const page  = parseInt(req.query.page)  || 1;
     const limit = Math.min(parseInt(req.query.limit) || 100, 200);
+
+    const [
+      clientsSnap, hotSnap, coldSnap, closedSnap,
+      usersSnap, pendingSnap, productsSnap,
+    ] = await Promise.all([
+      clientsCol.orderBy("createdAt", "desc").get(),
+      clientsCol.where("status", "==", "Hot").count().get(),
+      clientsCol.where("status", "==", "Cold").count().get(),
+      clientsCol.where("status", "==", "Closed").count().get(),
+      usersCol.where("status", "==", "approved").count().get(),
+      usersCol.where("status", "==", "pending").count().get(),
+      clientsCol.select("product").get(),
+    ]);
+
+    const allDocs  = clientsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const total    = allDocs.length;
+    const clients  = allDocs.slice((page - 1) * limit, page * limit);
+    const products = [...new Set(productsSnap.docs.map(d => d.data().product).filter(Boolean))];
+
+    res.set("Cache-Control", "private, max-age=30");
+    res.json({
+      clients, total, page,
+      pages: Math.ceil(total / limit),
+      stats: {
+        total, products,
+        byStatus: {
+          Hot:    hotSnap.data().count,
+          Cold:   coldSnap.data().count,
+          Closed: closedSnap.data().count,
+        },
+        approvedUsers: usersSnap.data().count,
+        pendingUsers:  pendingSnap.data().count,
+      },
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/clients", authMiddleware, approvedMiddleware, async (req, res) => {
+  try {
+    const page   = parseInt(req.query.page)  || 1;
+    const limit  = Math.min(parseInt(req.query.limit) || 100, 200);
     const search = req.query.search?.toLowerCase() || "";
     const status = req.query.status || "";
 
-    // Always query ordered by createdAt desc — no JS sort needed
     let query = clientsCol.orderBy("createdAt", "desc");
     if (status && ["Hot","Cold","Closed"].includes(status)) {
       query = clientsCol.where("status", "==", status).orderBy("createdAt", "desc");
@@ -692,54 +787,6 @@ app.get("/api/clients", authMiddleware, approvedMiddleware, async (req, res) => 
     const clients = docs.slice((page - 1) * limit, page * limit);
     res.set("Cache-Control", "private, max-age=20");
     res.json({ clients, total, page, pages: Math.ceil(total / limit) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-
-// Frontend calls this on initial load instead of two separate calls
-app.get("/api/dashboard", authMiddleware, approvedMiddleware, async (req, res) => {
-  try {
-    const page  = parseInt(req.query.page)  || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 100, 200);
-
-    const [
-      clientsSnap,
-      hotSnap, coldSnap, closedSnap,
-      usersSnap, pendingSnap,
-      productsSnap,
-    ] = await Promise.all([
-      clientsCol.orderBy("createdAt", "desc").get(),
-      clientsCol.where("status", "==", "Hot").count().get(),
-      clientsCol.where("status", "==", "Cold").count().get(),
-      clientsCol.where("status", "==", "Closed").count().get(),
-      usersCol.where("status", "==", "approved").count().get(),
-      usersCol.where("status", "==", "pending").count().get(),
-      clientsCol.select("product").get(),
-    ]);
-
-    const allDocs  = clientsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-    const total    = allDocs.length;
-    const clients  = allDocs.slice((page - 1) * limit, page * limit);
-    const products = [...new Set(productsSnap.docs.map(d => d.data().product).filter(Boolean))];
-
-    res.set("Cache-Control", "private, max-age=20");
-    res.json({
-      clients,
-      total,
-      page,
-      pages: Math.ceil(total / limit),
-      stats: {
-        total,
-        products,
-        byStatus: {
-          Hot:    hotSnap.data().count,
-          Cold:   coldSnap.data().count,
-          Closed: closedSnap.data().count,
-        },
-        approvedUsers: usersSnap.data().count,
-        pendingUsers:  pendingSnap.data().count,
-      },
-    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -798,9 +845,8 @@ app.post("/api/clients", authMiddleware, approvedMiddleware, async (req, res) =>
     const num = normalizePhone(number);
     if (!num) return res.status(400).json({ error: "Invalid phone number" });
 
-
-const dupSnap = await clientsCol.where("number", "==", num).limit(1).get();
-if (!dupSnap.empty) return res.status(409).json({ error: "Client with this number already exists" });
+    const dupSnap = await clientsCol.where("number", "==", num).limit(1).get();
+    if (!dupSnap.empty) return res.status(409).json({ error: "Client with this number already exists" });
 
     const now    = nowIST();
     const docRef = clientsCol.doc();
@@ -828,7 +874,6 @@ app.patch("/api/clients/:id", authMiddleware, approvedMiddleware, async (req, re
     allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
     if (Object.keys(update).length === 0) return res.status(400).json({ error: "Nothing to update" });
     const docRef = clientsCol.doc(req.params.id);
-    // Use transaction so we read+write in one round trip instead of two
     const result = await db.runTransaction(async t => {
       const snap = await t.get(docRef);
       if (!snap.exists) throw new Error("Not found");
@@ -881,6 +926,7 @@ app.post("/api/users/approve", authMiddleware, approvedMiddleware, async (req, r
     );
     const docSnap = await usersCol.doc(norm).get();
     if (docSnap.data()?.chatId) {
+      clearBotUserCache(docSnap.data().chatId);
       bot.sendMessage(docSnap.data().chatId, "🎉 *You've been approved!* Send /help to start.", { parse_mode: "Markdown" });
     }
     res.json({ ok: true });
@@ -892,32 +938,34 @@ app.delete("/api/users/:phone", authMiddleware, approvedMiddleware, async (req, 
     const norm = normalizePhone(req.params.phone);
     if (!norm) return res.status(400).json({ error: "Invalid phone" });
     const docSnap = await usersCol.doc(norm).get();
-    if (docSnap.exists && docSnap.data().chatId) {
-      bot.sendMessage(docSnap.data().chatId, "ℹ️ Your access has been removed.");
+    if (docSnap.exists) {
+      const u = docSnap.data();
+      if (u.chatId) {
+        clearBotUserCache(u.chatId);
+        bot.sendMessage(u.chatId, "ℹ️ Your access has been removed.");
+      }
+      // Clear approved middleware cache by uid if present
+      if (u.uid) clearApprovedCache(u.uid);
     }
     await usersCol.doc(norm).delete();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-
-// ── GET /api/machines ─────────────────────────────────────────────
+// ── Machines ──────────────────────────────────────────────────────────
 app.get("/api/machines", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
-    const snap = await machinesCol.orderBy("createdAt", "asc").get();
+    const snap     = await machinesCol.orderBy("createdAt", "asc").get();
     const machines = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    res.set("Cache-Control", "private, max-age=30");
+    res.set("Cache-Control", "private, max-age=300"); // 5 min — machines rarely change
     res.json({ machines });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── POST /api/machines ────────────────────────────────────────────
 app.post("/api/machines", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const { name, category, power, notes, variants } = req.body;
     if (!name?.trim()) return res.status(400).json({ error: "name required" });
-
-    // variants: [{ label, capacity, size, price }]
     const cleanVariants = Array.isArray(variants)
       ? variants.map(v => ({
           id:       v.id || `v_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
@@ -927,14 +975,10 @@ app.post("/api/machines", authMiddleware, approvedMiddleware, async (req, res) =
           price:    v.price    || "",
         }))
       : [];
-
     const docRef = machinesCol.doc();
-    const data = {
-      name:      name.trim(),
-      category:  category  || "",
-      power:     power     || "",
-      notes:     notes     || "",
-      variants:  cleanVariants,
+    const data   = {
+      name: name.trim(), category: category || "", power: power || "",
+      notes: notes || "", variants: cleanVariants,
       addedBy:   req.user.email || "Dashboard",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -944,22 +988,19 @@ app.post("/api/machines", authMiddleware, approvedMiddleware, async (req, res) =
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── PATCH /api/machines/:id ───────────────────────────────────────
 app.patch("/api/machines/:id", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     const { name, category, power, notes, variants } = req.body;
     const update = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
-    if (name      !== undefined) update.name     = name.trim();
-    if (category  !== undefined) update.category = category;
-    if (power     !== undefined) update.power    = power;
-    if (notes     !== undefined) update.notes    = notes;
-    if (variants  !== undefined) {
+    if (name     !== undefined) update.name     = name.trim();
+    if (category !== undefined) update.category = category;
+    if (power    !== undefined) update.power    = power;
+    if (notes    !== undefined) update.notes    = notes;
+    if (variants !== undefined) {
       update.variants = variants.map(v => ({
         id:       v.id || `v_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
-        label:    v.label    || "",
-        capacity: v.capacity || "",
-        size:     v.size     || "",
-        price:    v.price    || "",
+        label:    v.label || "", capacity: v.capacity || "",
+        size:     v.size  || "", price:    v.price    || "",
       }));
     }
     const docRef = machinesCol.doc(req.params.id);
@@ -970,7 +1011,6 @@ app.patch("/api/machines/:id", authMiddleware, approvedMiddleware, async (req, r
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── DELETE /api/machines/:id ──────────────────────────────────────
 app.delete("/api/machines/:id", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
     await machinesCol.doc(req.params.id).delete();
@@ -978,48 +1018,64 @@ app.delete("/api/machines/:id", authMiddleware, approvedMiddleware, async (req, 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ════════════════════════════════════════════════════════════════
-// VAULT — Secure Password Store
-// ════════════════════════════════════════════════════════════════
-const crypto  = require("crypto");
-const jwt     = require("jsonwebtoken");
-
-const VAULT_OTP     = process.env.VAULT_OTP;
-const VAULT_SECRET  = process.env.VAULT_JWT_SECRET;
-const VAULT_ENC_KEY = process.env.VAULT_ENCRYPT_KEY; // must be 32 chars
-const vaultCol      = db.collection("vault");
-
-// ── Encrypt / Decrypt ─────────────────────────────────────────
-function encrypt(text) {
-  const iv  = crypto.randomBytes(16);
-  const key = Buffer.from(VAULT_ENC_KEY.padEnd(32).slice(0, 32));
-  const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
-  const encrypted = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
-  return iv.toString("hex") + ":" + encrypted.toString("hex");
-}
-
-function decrypt(data) {
-  const [ivHex, encHex] = data.split(":");
-  const iv  = Buffer.from(ivHex, "hex");
-  const key = Buffer.from(VAULT_ENC_KEY.padEnd(32).slice(0, 32));
-  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
-  const dec = Buffer.concat([decipher.update(Buffer.from(encHex, "hex")), decipher.final()]);
-  return dec.toString("utf8");
-}
-
-// ── Vault JWT middleware ───────────────────────────────────────
-function vaultAuth(req, res, next) {
-  const header = req.headers["x-vault-token"];
-  if (!header) return res.status(401).json({ error: "Vault token required" });
+// ── Contractors ───────────────────────────────────────────────────────
+app.get("/api/contractors", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
-    req.vault = jwt.verify(header, VAULT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ error: "Invalid or expired vault token" });
-  }
-}
+    const snap        = await contractorsCol.orderBy("createdAt", "asc").get();
+    const contractors = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.set("Cache-Control", "private, max-age=300"); // 5 min
+    res.json({ contractors });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-// ── POST /api/vault/verify — check OTP, return vault JWT ──────
+app.post("/api/contractors", authMiddleware, approvedMiddleware, async (req, res) => {
+  try {
+    const { name, location, categories } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: "name required" });
+    const cleanCats = Array.isArray(categories)
+      ? [...new Set(categories.map(c => String(c).trim()).filter(Boolean))]
+      : [];
+    const docRef = contractorsCol.doc();
+    const data   = {
+      name:       name.trim(),
+      location:   location  || "",
+      categories: cleanCats,
+      addedBy:    req.user.email || "Dashboard",
+      createdAt:  admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt:  admin.firestore.FieldValue.serverTimestamp(),
+    };
+    await docRef.set(data);
+    res.status(201).json({ id: docRef.id, ...data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch("/api/contractors/:id", authMiddleware, approvedMiddleware, async (req, res) => {
+  try {
+    const { name, location, categories } = req.body;
+    const update = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    if (name       !== undefined) update.name       = name.trim();
+    if (location   !== undefined) update.location   = location;
+    if (categories !== undefined) {
+      update.categories = Array.isArray(categories)
+        ? [...new Set(categories.map(c => String(c).trim()).filter(Boolean))]
+        : [];
+    }
+    const docRef = contractorsCol.doc(req.params.id);
+    const snap   = await docRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Contractor not found" });
+    await docRef.update(update);
+    res.json({ id: snap.id, ...snap.data(), ...update });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete("/api/contractors/:id", authMiddleware, approvedMiddleware, async (req, res) => {
+  try {
+    await contractorsCol.doc(req.params.id).delete();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Vault ─────────────────────────────────────────────────────────────
 app.post("/api/vault/verify", authMiddleware, (req, res) => {
   if (!VAULT_OTP || !VAULT_SECRET || !VAULT_ENC_KEY) {
     return res.status(500).json({ error: "Vault not configured" });
@@ -1028,15 +1084,10 @@ app.post("/api/vault/verify", authMiddleware, (req, res) => {
   if (!otp || String(otp).trim() !== String(VAULT_OTP).trim()) {
     return res.status(403).json({ error: "Invalid OTP" });
   }
-  const token = jwt.sign(
-    { uid: req.user.uid, vault: true },
-    VAULT_SECRET,
-    { expiresIn: "1h" }
-  );
+  const token = jwt.sign({ uid: req.user.uid, vault: true }, VAULT_SECRET, { expiresIn: "1h" });
   res.json({ token });
 });
 
-// ── GET /api/vault/entries — list all decrypted entries ───────
 app.get("/api/vault/entries", authMiddleware, vaultAuth, async (req, res) => {
   try {
     const snap    = await vaultCol.orderBy("createdAt", "desc").get();
@@ -1045,10 +1096,10 @@ app.get("/api/vault/entries", authMiddleware, vaultAuth, async (req, res) => {
       return {
         id:        d.id,
         title:     data.title,
-        username:  data.username  ? decrypt(data.username)  : "",
-        password:  data.password  ? decrypt(data.password)  : "",
-        url:       data.url       ? decrypt(data.url)       : "",
-        note:      data.note      ? decrypt(data.note)      : "",
+        username:  data.username ? decrypt(data.username) : "",
+        password:  data.password ? decrypt(data.password) : "",
+        url:       data.url      ? decrypt(data.url)      : "",
+        note:      data.note     ? decrypt(data.note)     : "",
         createdAt: data.createdAt,
         updatedAt: data.updatedAt,
       };
@@ -1057,7 +1108,6 @@ app.get("/api/vault/entries", authMiddleware, vaultAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── POST /api/vault/entries — save new entry ──────────────────
 app.post("/api/vault/entries", authMiddleware, vaultAuth, async (req, res) => {
   try {
     const { title, username, password, url, note } = req.body;
@@ -1070,21 +1120,14 @@ app.post("/api/vault/entries", authMiddleware, vaultAuth, async (req, res) => {
       url:      url      ? encrypt(url)      : "",
       note:     note     ? encrypt(note)     : "",
       addedBy:  req.user.uid,
-      createdAt: now,
-      updatedAt: now,
+      createdAt: now, updatedAt: now,
     };
     const ref = vaultCol.doc();
     await ref.set(data);
-    res.status(201).json({
-      id: ref.id, title,
-      username: username || "",
-      password: password || "",
-      url: url || "", note: note || "",
-    });
+    res.status(201).json({ id: ref.id, title, username: username || "", password: password || "", url: url || "", note: note || "" });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── PATCH /api/vault/entries/:id — update entry ───────────────
 app.patch("/api/vault/entries/:id", authMiddleware, vaultAuth, async (req, res) => {
   try {
     const { title, username, password, url, note } = req.body;
@@ -1099,7 +1142,6 @@ app.patch("/api/vault/entries/:id", authMiddleware, vaultAuth, async (req, res) 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── DELETE /api/vault/entries/:id — delete entry ──────────────
 app.delete("/api/vault/entries/:id", authMiddleware, vaultAuth, async (req, res) => {
   try {
     await vaultCol.doc(req.params.id).delete();
@@ -1107,18 +1149,14 @@ app.delete("/api/vault/entries/:id", authMiddleware, vaultAuth, async (req, res)
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-
-// ── Global error handler ──────────────────────────────────────────────────────
+// ── Global error handler ──────────────────────────────────────────────
 app.use((err, req, res, next) => {
   console.error("Express error:", err.message);
   if (err.message?.includes("CORS")) return res.status(403).json({ error: "CORS blocked" });
   res.status(500).json({ error: "Internal server error" });
 });
 
-
-
-
-// ── Uncaught exception safety net ────────────────────────────────────────────
+// ── Uncaught exceptions ───────────────────────────────────────────────
 process.on("uncaughtException",  e => console.error("Uncaught exception:", e.message));
 process.on("unhandledRejection", e => console.error("Unhandled rejection:", e));
 
