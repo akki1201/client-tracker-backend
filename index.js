@@ -1030,7 +1030,7 @@ app.get("/api/contractors", authMiddleware, approvedMiddleware, async (req, res)
 
 app.post("/api/contractors", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
-    const { name, location, categories } = req.body;
+    const { name, phone, location, categories } = req.body;
     if (!name?.trim()) return res.status(400).json({ error: "name required" });
     const cleanCats = Array.isArray(categories)
       ? [...new Set(categories.map(c => String(c).trim()).filter(Boolean))]
@@ -1038,6 +1038,7 @@ app.post("/api/contractors", authMiddleware, approvedMiddleware, async (req, res
     const docRef = contractorsCol.doc();
     const data   = {
       name:       name.trim(),
+      phone:      phone     || "",
       location:   location  || "",
       categories: cleanCats,
       addedBy:    req.user.email || "Dashboard",
@@ -1051,9 +1052,10 @@ app.post("/api/contractors", authMiddleware, approvedMiddleware, async (req, res
 
 app.patch("/api/contractors/:id", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
-    const { name, location, categories } = req.body;
+    const { name, phone, location, categories } = req.body;
     const update = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
     if (name       !== undefined) update.name       = name.trim();
+    if (phone    !== undefined) update.phone    = phone;
     if (location   !== undefined) update.location   = location;
     if (categories !== undefined) {
       update.categories = Array.isArray(categories)
