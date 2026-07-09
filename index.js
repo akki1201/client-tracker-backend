@@ -15,6 +15,13 @@ const TOKEN       = process.env.TELEGRAM_TOKEN;
 const ADMIN_PHONE = process.env.ADMIN_PHONE;
 const PORT        = process.env.PORT || 3001;
 
+let _dashboardCache = null; // { data, at }
+const DASHBOARD_TTL = 15_000; // 15s — dashboard already sends Cache-Control 30s to browser
+
+function invalidateDashboardCache() {
+  _dashboardCache = null;
+}
+
 const REQUIRED_ENV = [
   "TELEGRAM_TOKEN", "ADMIN_PHONE",
   "FIREBASE_PROJECT_ID", "FIREBASE_PRIVATE_KEY", "FIREBASE_CLIENT_EMAIL",
@@ -724,6 +731,14 @@ app.get("/api/dashboard", authMiddleware, approvedMiddleware, async (req, res) =
     const page  = parseInt(req.query.page)  || 1;
     const limit = Math.min(parseInt(req.query.limit) || 100, 200);
 
+    if (_dashboardCache && (Date.now() - _dashboardCache.at < DASHBOARD_TTL)) {
+      const { allDocs, stats } = _dashboardCache.data;
+      const total   = allDocs.length;
+      const clients = allDocs.slice((page - 1) * limit, page * limit);
+      res.set("Cache-Control", "private, max-age=30");
+      return res.json({ clients, total, page, pages: Math.ceil(total / limit), stats });
+    }
+
     const [
       clientsSnap, hotSnap, coldSnap, closedSnap,
       usersSnap, pendingSnap, productsSnap,
@@ -738,25 +753,20 @@ app.get("/api/dashboard", authMiddleware, approvedMiddleware, async (req, res) =
     ]);
 
     const allDocs  = clientsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-    const total    = allDocs.length;
-    const clients  = allDocs.slice((page - 1) * limit, page * limit);
     const products = [...new Set(productsSnap.docs.map(d => d.data().product).filter(Boolean))];
+    const stats = {
+      total: allDocs.length, products,
+      byStatus: { Hot: hotSnap.data().count, Cold: coldSnap.data().count, Closed: closedSnap.data().count },
+      approvedUsers: usersSnap.data().count,
+      pendingUsers:  pendingSnap.data().count,
+    };
 
+    _dashboardCache = { data: { allDocs, stats }, at: Date.now() };
+
+    const total   = allDocs.length;
+    const clients = allDocs.slice((page - 1) * limit, page * limit);
     res.set("Cache-Control", "private, max-age=30");
-    res.json({
-      clients, total, page,
-      pages: Math.ceil(total / limit),
-      stats: {
-        total, products,
-        byStatus: {
-          Hot:    hotSnap.data().count,
-          Cold:   coldSnap.data().count,
-          Closed: closedSnap.data().count,
-        },
-        approvedUsers: usersSnap.data().count,
-        pendingUsers:  pendingSnap.data().count,
-      },
-    });
+    res.json({ clients, total, page, pages: Math.ceil(total / limit), stats });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
