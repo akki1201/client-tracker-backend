@@ -967,7 +967,7 @@ app.get("/api/machines", authMiddleware, approvedMiddleware, async (req, res) =>
   try {
     const snap     = await machinesCol.orderBy("createdAt", "asc").get();
     const machines = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    res.set("Cache-Control", "private, max-age=300"); // 5 min — machines rarely change
+    res.set("Cache-Control", "no-store");
     res.json({ machines });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1031,9 +1031,9 @@ app.delete("/api/machines/:id", authMiddleware, approvedMiddleware, async (req, 
 // ── Contractors ───────────────────────────────────────────────────────
 app.get("/api/contractors", authMiddleware, approvedMiddleware, async (req, res) => {
   try {
-    const snap        = await contractorsCol.orderBy("createdAt", "asc").get();
+    const snap = await contractorsCol.orderBy("createdAt", "asc").get();
     const contractors = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    res.set("Cache-Control", "private, max-age=300"); // 5 min
+    res.set("Cache-Control", "no-store");
     res.json({ contractors });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
